@@ -9,3 +9,5 @@ downloads/
 token.json
 client_secret.json
 credentials.json
+cookies.txt
+*.cookies.txt
