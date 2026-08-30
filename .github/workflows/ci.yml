@@ -34,6 +34,8 @@ jobs:
           dramafren_drive_worker.py
           dramafren_bulk.py
           dramafren_queue.py
+          library_db.py
+          ingest_local_media.py
 
       - name: Smoke-test product invariants
         run: |
@@ -64,6 +66,54 @@ jobs:
           print("DramaFren queue URL normalization OK")
           PY
 
+      - name: Smoke-test library catalogue
+        run: |
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from library_db import LibraryDB
+
+          with tempfile.TemporaryDirectory() as td:
+              db = LibraryDB(Path(td) / "library.db")
+              drama = db.upsert_drama(title="Test Drama", genres=["Drama"])
+              same = db.upsert_drama(title="Test Drama", description="Updated")
+              assert drama["id"] == same["id"]
+
+              source = db.add_source(
+                  drama_id=drama["id"],
+                  platform="owned",
+                  external_id="test-1",
+                  status="owned_or_authorized",
+              )
+              episode = db.upsert_episode(drama_id=drama["id"], episode_number=1)
+              db.link_episode_source(
+                  episode_id=episode["id"],
+                  source_id=source["id"],
+                  status="owned_or_authorized",
+              )
+              file_record = db.register_file(
+                  episode_id=episode["id"],
+                  storage_provider="google_drive",
+                  provider_file_id="drive-test-id",
+                  sha256="a" * 64,
+                  bytes_size=1234,
+                  mime_type="video/mp4",
+                  verified=True,
+                  verification={"verified": True},
+              )
+              assert file_record["verified"] is True
+              assert db.find_file_by_sha256("a" * 64)["id"] == file_record["id"]
+
+              detail = db.get_drama(drama["slug"])
+              assert detail is not None
+              assert len(detail["episodes"]) == 1
+              assert len(detail["episodes"][0]["files"]) == 1
+              assert detail["episodes"][0]["files"][0]["verified"] is True
+              assert db.list_dramas()[0]["verified_files"] == 1
+
+          print("Library catalogue schema, dedupe, episode linking and file registration OK")
+          PY
+
       - name: Import and smoke-test MCP server
         run: |
           python - <<'PY'
@@ -78,7 +128,8 @@ jobs:
       - name: Import local worker and launcher
         run: |
           python - <<'PY'
+          import ingest_local_media
           import local_worker
           import start_worker
-          print("Tokisclone local worker + launcher + DramaFren integration import OK")
+          print("Tokisclone local worker + library ingest + launcher import OK")
           PY
