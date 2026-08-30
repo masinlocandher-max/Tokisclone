@@ -13,6 +13,13 @@ from urllib.parse import urlparse
 
 import yt_dlp
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from drive_storage import DriveStorage
 
 POLL_SECONDS = max(5, int(os.getenv("TOKISCLONE_POLL_SECONDS", "15")))
@@ -135,8 +142,6 @@ def _download_one(url: str, workdir: Path) -> tuple[Path, dict[str, Any]]:
         {
             "noplaylist": True,
             "outtmpl": outtmpl,
-            # TikTok normally exposes a combined stream. Prefer it so ffmpeg is not
-            # required simply to save one public TikTok file.
             "format": "best[ext=mp4]/best",
         }
     ) as ydl:
@@ -205,8 +210,7 @@ def _save_video(
             }
 
         creator = _safe(
-            str(metadata.get("uploader_id") or metadata.get("uploader") or creator_hint or "creator")
-            .lstrip("@"),
+            str(metadata.get("uploader_id") or metadata.get("uploader") or creator_hint or "creator").lstrip("@"),
             "creator",
         )
         video_folder = storage.creator_subfolder("tiktok", creator, "videos")
@@ -377,7 +381,9 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
 
     return {
         "kind": "profile",
-        "ok": failed == 0,
+        "ok": True,
+        "complete": failed == 0,
+        "status": "completed" if failed == 0 else "completed_with_errors",
         "profile_url": profile_url,
         "found": found,
         "already_saved": already_saved,
@@ -437,11 +443,7 @@ def process_queue_once(storage: DriveStorage) -> int:
             name=result_name,
             properties={"kind": "job_result", "job_file_id": _short_prop(job_id)},
         )
-        storage.move_file(
-            job_id,
-            from_parent=queue["id"],
-            to_parent=result_parent,
-        )
+        storage.move_file(job_id, from_parent=queue["id"], to_parent=result_parent)
         print(json.dumps({"job": job_name, "result": result}, ensure_ascii=False))
 
     return processed
