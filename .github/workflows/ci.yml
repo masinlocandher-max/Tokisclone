@@ -31,19 +31,30 @@ jobs:
           process_job.py
           local_worker.py
 
-      - name: Smoke-test clean-source selector
+      - name: Smoke-test product invariants
         run: |
           python - <<'PY'
-          from media_core import video_format_selector
-          prefer = video_format_selector("best", "prefer-clean")
-          strict = video_format_selector("best", "clean-only")
-          assert "format_id!=download" in prefer
-          assert "format_id!=download" in strict
-          print("Clean-source selector OK")
+          import inspect
+          import media_core
+
+          assert media_core.MANDATORY_SOURCE_POLICY == "clean-only"
+          selector = media_core.video_format_selector("best", "allow")
+          assert "format_id!=download" in selector
+          assert selector == media_core.video_format_selector("best", "prefer-clean")
+          assert "playlistend" not in inspect.getsource(media_core._extract_profile)
+          print("Mandatory clean-only and all-public profile invariants OK")
           PY
 
       - name: Import and smoke-test MCP server
-        run: python -c "import server; assert server.health()['ok']; print('Tokisclone MCP import and health OK')"
+        run: |
+          python - <<'PY'
+          import server
+          health = server.health()
+          assert health["ok"]
+          assert health["source_policy"] == "clean-only"
+          assert health["profile_scope"] == "all_public"
+          print("Tokisclone MCP import and health OK")
+          PY
 
       - name: Import local worker
         run: python -c "import local_worker; print('Tokisclone local worker import OK')"
