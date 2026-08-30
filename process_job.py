@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from dramafren_job import run_dramafren_job
 from media_core import (
     MANDATORY_SOURCE_POLICY,
     bulk_download,
@@ -152,10 +153,12 @@ def main() -> int:
             result = profile_all(job, out)
         elif kind == "bulk_urls":
             result = bulk_urls(job, out)
+        elif kind in {"dramafren", "dramafren_drama"}:
+            result = run_dramafren_job(job, out)
         else:
             raise ValueError(
                 "Unsupported job kind. Use diagnostic, inspect, video, profile, "
-                "bulk_profile, or bulk_urls."
+                "bulk_profile, bulk_urls, or dramafren."
             )
         status = 0
     except Exception as exc:
