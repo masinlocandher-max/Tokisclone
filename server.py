@@ -4,21 +4,22 @@ import csv
 import io
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
 import yt_dlp
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
 
-mcp = MCPServer("FMB Video MCP")
+from drive_storage import DriveStorage
 
-DEFAULT_DOWNLOAD_DIR = Path(os.getenv("VIDEO_DOWNLOAD_DIR", "/tmp/fmb-video-mcp"))
-DEFAULT_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+mcp = FastMCP("Tokisclone", stateless_http=True, json_response=True)
+TEMP_ROOT = Path(os.getenv("VIDEO_DOWNLOAD_DIR", "/tmp/tokisclone"))
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _clean_info(info: dict[str, Any]) -> dict[str, Any]:
-    """Return a stable, compact metadata shape instead of yt-dlp's entire payload."""
     return {
         "id": info.get("id"),
         "url": info.get("webpage_url") or info.get("original_url"),
@@ -41,24 +42,30 @@ def _clean_info(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ydl(extra: dict[str, Any] | None = None) -> yt_dlp.YoutubeDL:
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": False,
-    }
+    opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": False}
     if extra:
         opts.update(extra)
     return yt_dlp.YoutubeDL(opts)
 
 
-@mcp.tool()
-def inspect_video(url: str) -> dict[str, Any]:
-    """
-    Inspect a public video URL and return normalized metadata.
+def _platform(url: str, extractor: str | None = None) -> str:
+    haystack = f"{url} {extractor or ''}".lower()
+    if "tiktok" in haystack:
+        return "tiktok"
+    if "instagram" in haystack:
+        return "instagram"
+    if "youtube" in haystack or "youtu.be" in haystack:
+        return "youtube"
+    return (extractor or "other").lower()
 
-    Supports sites handled by yt-dlp, including TikTok when its extractor is working.
-    Does not attempt to bypass private accounts, login walls, CAPTCHAs, or DRM.
-    """
+
+def _safe_name(value: str | None, fallback: str = "unknown") -> str:
+    value = (value or fallback).strip().lstrip("@")
+    value = re.sub(r"[^A-Za-z0-9._ -]+", "_", value)
+    return value[:100] or fallback
+
+
+def _inspect_video(url: str) -> dict[str, Any]:
     with _ydl({"noplaylist": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
@@ -66,114 +73,239 @@ def inspect_video(url: str) -> dict[str, Any]:
     return _clean_info(info)
 
 
-@mcp.tool()
-def list_profile_videos(profile_url: str, limit: int = 50) -> dict[str, Any]:
-    """
-    Discover public videos from a creator/profile URL on a best-effort basis.
-
-    This depends on the upstream site's public page structure and yt-dlp extractor support.
-    It does not bypass private accounts, CAPTCHAs, or authentication barriers.
-    """
+def _list_profile(profile_url: str, limit: int) -> dict[str, Any]:
     if limit < 1:
         raise ValueError("limit must be at least 1")
     limit = min(limit, 500)
-
-    with _ydl({
-        "extract_flat": True,
-        "playlistend": limit,
-        "skip_download": True,
-    }) as ydl:
+    with _ydl({"extract_flat": True, "playlistend": limit, "skip_download": True}) as ydl:
         info = ydl.extract_info(profile_url, download=False)
-
     if not isinstance(info, dict):
         raise RuntimeError("No profile data was returned.")
 
     entries = info.get("entries") or []
     results: list[dict[str, Any]] = []
-
+    username = profile_url.rstrip("/").split("/")[-1]
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         item_url = entry.get("webpage_url") or entry.get("url")
-        if item_url and str(item_url).isdigit() and "tiktok" in profile_url.lower():
-            username = profile_url.rstrip("/").split("/")[-1]
-            if username.startswith("@"):
-                item_url = f"https://www.tiktok.com/{username}/video/{item_url}"
-        results.append({
-            "id": entry.get("id"),
-            "url": item_url,
-            "title": entry.get("title") or entry.get("description"),
-            "duration": entry.get("duration"),
-            "timestamp": entry.get("timestamp"),
-            "view_count": entry.get("view_count"),
-            "like_count": entry.get("like_count"),
-            "thumbnail": entry.get("thumbnail"),
-        })
+        if item_url and str(item_url).isdigit() and "tiktok" in profile_url.lower() and username.startswith("@"):
+            item_url = f"https://www.tiktok.com/{username}/video/{item_url}"
+        results.append(
+            {
+                "id": entry.get("id"),
+                "url": item_url,
+                "title": entry.get("title") or entry.get("description"),
+                "duration": entry.get("duration"),
+                "timestamp": entry.get("timestamp"),
+                "view_count": entry.get("view_count"),
+                "like_count": entry.get("like_count"),
+                "thumbnail": entry.get("thumbnail"),
+            }
+        )
+    return {"profile_url": profile_url, "count": len(results), "videos": results}
+
+
+def _download_to(url: str, workdir: Path) -> tuple[Path, dict[str, Any]]:
+    outtmpl = str(workdir / "%(id)s.%(ext)s")
+    with _ydl(
+        {
+            "noplaylist": True,
+            "outtmpl": outtmpl,
+            "format": "bv*+ba/b",
+            "merge_output_format": "mp4",
+        }
+    ) as ydl:
+        info = ydl.extract_info(url, download=True)
+    if not isinstance(info, dict):
+        raise RuntimeError("Download returned no metadata.")
+
+    video_id = str(info.get("id") or "")
+    candidates = [
+        p
+        for p in workdir.iterdir()
+        if p.is_file() and not p.name.endswith((".part", ".ytdl")) and (not video_id or p.stem.startswith(video_id))
+    ]
+    if not candidates:
+        raise RuntimeError("Downloaded media file could not be located.")
+    candidates.sort(key=lambda p: (p.suffix.lower() != ".mp4", -p.stat().st_size))
+    return candidates[0], _clean_info(info)
+
+
+def _transcribe_media(
+    media_path: Path,
+    model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "small",
+    language: str | None = None,
+) -> dict[str, Any]:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("faster-whisper is not installed.") from exc
+
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(str(media_path), language=language, vad_filter=True)
+    rows: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    for segment in segments:
+        text = segment.text.strip()
+        text_parts.append(text)
+        rows.append({"start": round(segment.start, 3), "end": round(segment.end, 3), "text": text})
+    return {
+        "language": getattr(info, "language", language),
+        "language_probability": getattr(info, "language_probability", None),
+        "duration": getattr(info, "duration", None),
+        "text": " ".join(text_parts).strip(),
+        "segments": rows,
+    }
+
+
+def _save_video_to_drive(
+    storage: DriveStorage,
+    url: str,
+    *,
+    transcribe: bool = False,
+    model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "small",
+    language: str | None = None,
+) -> dict[str, Any]:
+    metadata = _inspect_video(url)
+    video_id = str(metadata.get("id") or "")
+    if not video_id:
+        raise RuntimeError("Video ID could not be determined.")
+
+    platform = _platform(url, metadata.get("extractor"))
+    creator = _safe_name(metadata.get("uploader_id") or metadata.get("uploader") or metadata.get("channel"))
+    existing = storage.find_video(platform, video_id)
+    if existing:
+        return {"status": "already_saved", "metadata": metadata, "drive_file": existing}
+
+    creator_root = storage.creator_folder(platform, creator)
+    videos_folder = storage.ensure_folder("videos", creator_root["id"])
+    transcripts_folder = storage.ensure_folder("transcripts", creator_root["id"])
+
+    with tempfile.TemporaryDirectory(prefix="tokisclone-", dir=str(TEMP_ROOT)) as td:
+        media_path, downloaded_metadata = _download_to(url, Path(td))
+        props = {
+            "kind": "video",
+            "platform": platform,
+            "video_id": video_id,
+            "creator": creator,
+            "source_url": url[:124],
+        }
+        drive_file = storage.upload_file(
+            media_path,
+            parent_id=videos_folder["id"],
+            name=f"{video_id}{media_path.suffix.lower()}",
+            mime_type="video/mp4" if media_path.suffix.lower() == ".mp4" else None,
+            properties=props,
+        )
+
+        transcript_file = None
+        transcript = None
+        if transcribe:
+            transcript = _transcribe_media(media_path, model_size=model_size, language=language)
+            transcript_file = storage.upload_text(
+                transcript["text"],
+                parent_id=transcripts_folder["id"],
+                name=f"{video_id}.txt",
+                properties={**props, "kind": "transcript"},
+            )
 
     return {
-        "profile_url": profile_url,
-        "count": len(results),
-        "videos": results,
+        "status": "saved",
+        "metadata": downloaded_metadata,
+        "drive_file": drive_file,
+        "transcript_file": transcript_file,
+        "transcript": transcript,
     }
 
 
 @mcp.tool()
-def download_video(
+def inspect_video(url: str) -> dict[str, Any]:
+    """Inspect one public video URL and return normalized metadata."""
+    return _inspect_video(url)
+
+
+@mcp.tool()
+def list_profile_videos(profile_url: str, limit: int = 50) -> dict[str, Any]:
+    """Best-effort discovery of public videos from a creator/profile URL."""
+    return _list_profile(profile_url, limit)
+
+
+@mcp.tool()
+def save_video_to_drive(
     url: str,
-    output_dir: str | None = None,
-    filename_template: str = "%(uploader)s_%(id)s.%(ext)s",
+    transcribe: bool = False,
+    model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "small",
+    language: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Download a public video that yt-dlp can access.
+    """Download an authorized public video temporarily, save it permanently to Google Drive, then remove the temporary copy."""
+    return _save_video_to_drive(
+        DriveStorage(), url, transcribe=transcribe, model_size=model_size, language=language
+    )
 
-    Use only for content you own or are authorized to download/use.
-    No DRM, private-account, CAPTCHA, or authentication bypass is attempted.
-    """
-    target_dir = Path(output_dir) if output_dir else DEFAULT_DOWNLOAD_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(target_dir / filename_template)
 
-    with _ydl({
-        "noplaylist": True,
-        "outtmpl": outtmpl,
-        "format": "bv*+ba/b",
-        "merge_output_format": "mp4",
-    }) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not isinstance(info, dict):
-            raise RuntimeError("Download completed without metadata.")
-        requested = info.get("requested_downloads") or []
-        filepath = None
-        if requested and isinstance(requested, list):
-            filepath = requested[0].get("filepath")
-        filepath = filepath or ydl.prepare_filename(info)
+@mcp.tool()
+def sync_creator(
+    profile_url: str,
+    limit: int = 50,
+    transcribe: bool = False,
+) -> dict[str, Any]:
+    """Discover a creator's public videos and save only videos not already present in the Drive library."""
+    if limit > 100:
+        raise ValueError("Personal synchronous sync is capped at 100 videos per call. Run again for larger libraries.")
+    profile = _list_profile(profile_url, limit)
+    storage = DriveStorage()
+    saved: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for item in profile["videos"]:
+        url = item.get("url")
+        video_id = str(item.get("id") or "")
+        if not url:
+            errors.append({"video_id": video_id, "error": "No usable video URL returned."})
+            continue
+        try:
+            platform = _platform(profile_url)
+            if video_id and storage.find_video(platform, video_id):
+                skipped.append({"video_id": video_id, "url": url, "reason": "already_saved"})
+                continue
+            result = _save_video_to_drive(storage, url, transcribe=transcribe)
+            if result["status"] == "already_saved":
+                skipped.append({"video_id": video_id, "url": url, "reason": "already_saved"})
+            else:
+                saved.append({"video_id": video_id, "url": url, "drive_file": result["drive_file"]})
+        except Exception as exc:
+            errors.append({"video_id": video_id, "url": url, "error": str(exc)})
 
     return {
-        "metadata": _clean_info(info),
-        "filepath": filepath,
+        "profile_url": profile_url,
+        "discovered": profile["count"],
+        "saved": len(saved),
+        "already_saved": len(skipped),
+        "failed": len(errors),
+        "saved_items": saved,
+        "skipped_items": skipped,
+        "errors": errors,
     }
 
 
-def _download_audio(url: str, workdir: Path) -> Path:
-    outtmpl = str(workdir / "%(id)s.%(ext)s")
-    with _ydl({
-        "noplaylist": True,
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
-    }) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not isinstance(info, dict):
-            raise RuntimeError("Audio extraction returned no metadata.")
-        video_id = info.get("id")
-        candidates = list(workdir.glob(f"{video_id}*.wav")) if video_id else list(workdir.glob("*.wav"))
-        if not candidates:
-            raise RuntimeError("Audio conversion failed. Ensure ffmpeg is installed.")
-        return candidates[0]
+@mcp.tool()
+def list_drive_library(
+    platform: str | None = None,
+    creator: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List Tokisclone files already stored in Google Drive."""
+    files = DriveStorage().list_library(platform=platform, creator=creator, limit=limit)
+    return {"count": len(files), "files": files}
+
+
+@mcp.tool()
+def get_saved_video(video_id: str, platform: str = "tiktok") -> dict[str, Any]:
+    """Find a previously saved video in the Google Drive library by platform and video ID."""
+    item = DriveStorage().find_video(platform.lower(), video_id)
+    return {"found": item is not None, "file": item}
 
 
 @mcp.tool()
@@ -182,127 +314,80 @@ def transcribe_video(
     model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "small",
     language: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Transcribe a local media file or a public video URL using faster-whisper.
-
-    The model runs locally on the server. First use downloads the selected Whisper model.
-    """
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "faster-whisper is not installed. Install optional transcription dependencies."
-        ) from exc
-
-    with tempfile.TemporaryDirectory(prefix="fmb-video-mcp-") as td:
-        workdir = Path(td)
-        source = Path(url_or_path)
-
-        if source.exists():
-            media_path = source
-        elif url_or_path.startswith(("http://", "https://")):
-            media_path = _download_audio(url_or_path, workdir)
-        else:
-            raise ValueError("url_or_path must be an existing local path or an http(s) URL.")
-
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(
-            str(media_path),
-            language=language,
-            vad_filter=True,
-        )
-
-        rows = []
-        transcript_parts = []
-        for segment in segments:
-            text = segment.text.strip()
-            transcript_parts.append(text)
-            rows.append({
-                "start": round(segment.start, 3),
-                "end": round(segment.end, 3),
-                "text": text,
-            })
-
-        return {
-            "language": getattr(info, "language", language),
-            "language_probability": getattr(info, "language_probability", None),
-            "duration": getattr(info, "duration", None),
-            "text": " ".join(transcript_parts).strip(),
-            "segments": rows,
-        }
+    """Transcribe a local media path or public video URL with local faster-whisper."""
+    source = Path(url_or_path)
+    if source.exists():
+        return _transcribe_media(source, model_size=model_size, language=language)
+    if not url_or_path.startswith(("http://", "https://")):
+        raise ValueError("url_or_path must be a local path or http(s) URL.")
+    with tempfile.TemporaryDirectory(prefix="tokisclone-transcribe-", dir=str(TEMP_ROOT)) as td:
+        media_path, _ = _download_to(url_or_path, Path(td))
+        return _transcribe_media(media_path, model_size=model_size, language=language)
 
 
 @mcp.tool()
 def get_bulk_metadata(urls: list[str]) -> dict[str, Any]:
-    """Inspect multiple public video URLs and return successes and per-item errors."""
+    """Inspect up to 100 public video URLs and return successes and per-item errors."""
     if len(urls) > 100:
         raise ValueError("Maximum 100 URLs per call.")
-
-    results = []
-    errors = []
-
+    results, errors = [], []
     for url in urls:
         try:
-            results.append(inspect_video(url))
+            results.append(_inspect_video(url))
         except Exception as exc:
             errors.append({"url": url, "error": str(exc)})
-
-    return {
-        "requested": len(urls),
-        "succeeded": len(results),
-        "failed": len(errors),
-        "results": results,
-        "errors": errors,
-    }
+    return {"requested": len(urls), "succeeded": len(results), "failed": len(errors), "results": results, "errors": errors}
 
 
 @mcp.tool()
-def export_records(
-    records: list[dict[str, Any]],
-    format: Literal["json", "csv", "txt"] = "json",
-) -> str:
-    """Export structured records as JSON, CSV, or plain text."""
+def export_records(records: list[dict[str, Any]], format: Literal["json", "csv", "txt"] = "json") -> str:
+    """Export records as JSON, CSV, or plain text."""
     if format == "json":
         return json.dumps(records, ensure_ascii=False, indent=2)
-
     if format == "txt":
-        chunks = []
-        for i, row in enumerate(records, start=1):
-            chunks.append(f"RECORD {i}\n" + "\n".join(f"{k}: {v}" for k, v in row.items()))
-        return "\n\n".join(chunks)
-
-    all_keys: list[str] = []
-    seen = set()
+        return "\n\n".join(
+            f"RECORD {i}\n" + "\n".join(f"{k}: {v}" for k, v in row.items())
+            for i, row in enumerate(records, start=1)
+        )
+    keys: list[str] = []
+    seen: set[str] = set()
     for row in records:
-        for key in row.keys():
+        for key in row:
             if key not in seen:
                 seen.add(key)
-                all_keys.append(key)
-
+                keys.append(key)
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=all_keys)
+    writer = csv.DictWriter(buf, fieldnames=keys)
     writer.writeheader()
     for row in records:
-        writer.writerow({
-            k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
-            for k, v in row.items()
-        })
+        writer.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()})
     return buf.getvalue()
 
 
 @mcp.tool()
+def drive_status() -> dict[str, Any]:
+    """Verify that Tokisclone can authenticate to its configured Google Drive root folder."""
+    return DriveStorage().status()
+
+
+@mcp.tool()
 def health() -> dict[str, Any]:
-    """Return a simple health/status response."""
+    """Return server health and the personal-tool feature set."""
     return {
         "ok": True,
-        "name": "FMB Video MCP",
+        "name": "Tokisclone",
+        "storage": "Google Drive",
         "tools": [
             "inspect_video",
             "list_profile_videos",
-            "download_video",
+            "save_video_to_drive",
+            "sync_creator",
+            "list_drive_library",
+            "get_saved_video",
             "transcribe_video",
             "get_bulk_metadata",
             "export_records",
+            "drive_status",
         ],
     }
 
