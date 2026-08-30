@@ -22,6 +22,8 @@ def _clean(info: dict[str, Any]) -> dict[str, Any]:
         "title": info.get("title") or info.get("description"),
         "uploader": info.get("uploader"),
         "uploader_id": info.get("uploader_id"),
+        "channel": info.get("channel"),
+        "channel_id": info.get("channel_id"),
         "duration": info.get("duration"),
         "timestamp": info.get("timestamp"),
         "upload_date": info.get("upload_date"),
@@ -49,6 +51,30 @@ def diagnostic(job: dict[str, Any], out: Path) -> dict[str, Any]:
     path = out / "diagnostic.txt"
     path.write_text(text + "\n", encoding="utf-8")
     return {"kind": "diagnostic", "ok": True, "file": path.name}
+
+
+def inspect_url(job: dict[str, Any], out: Path) -> dict[str, Any]:
+    url = str(job.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("inspect job requires an http(s) url")
+
+    with _ydl({"noplaylist": True, "skip_download": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not isinstance(info, dict):
+        raise RuntimeError("yt-dlp returned no metadata")
+
+    metadata = _clean(info)
+    path = out / "metadata.json"
+    path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "kind": "inspect",
+        "ok": True,
+        "metadata": metadata,
+        "file": path.name,
+    }
 
 
 def download_video(job: dict[str, Any], out: Path) -> dict[str, Any]:
@@ -92,12 +118,7 @@ def download_video(job: dict[str, Any], out: Path) -> dict[str, Any]:
     }
 
 
-def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
-    profile_url = str(job.get("profile_url") or "").strip()
-    if not profile_url.startswith(("http://", "https://")):
-        raise ValueError("profile job requires profile_url")
-
-    limit = max(1, min(int(job.get("limit", 50)), 500))
+def _extract_profile(source: str, limit: int) -> dict[str, Any]:
     with _ydl(
         {
             "extract_flat": True,
@@ -105,11 +126,25 @@ def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
             "skip_download": True,
         }
     ) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
-
+        info = ydl.extract_info(source, download=False)
     if not isinstance(info, dict):
         raise RuntimeError("yt-dlp returned no profile data")
+    return info
 
+
+def _channel_id_from_video(seed_video_url: str) -> str | None:
+    with _ydl({"noplaylist": True, "skip_download": True}) as ydl:
+        info = ydl.extract_info(seed_video_url, download=False)
+    if not isinstance(info, dict):
+        return None
+    channel_id = info.get("channel_id")
+    return str(channel_id) if channel_id else None
+
+
+def _normalize_profile_entries(
+    info: dict[str, Any],
+    profile_url: str,
+) -> list[dict[str, Any]]:
     username = profile_url.rstrip("/").split("/")[-1]
     videos: list[dict[str, Any]] = []
     for entry in info.get("entries") or []:
@@ -134,6 +169,42 @@ def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
                 "like_count": entry.get("like_count"),
             }
         )
+    return videos
+
+
+def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
+    profile_url = str(job.get("profile_url") or "").strip()
+    if not profile_url.startswith(("http://", "https://")):
+        raise ValueError("profile job requires profile_url")
+
+    limit = max(1, min(int(job.get("limit", 50)), 500))
+    seed_video_url = str(job.get("seed_video_url") or "").strip()
+    discovery_method = "profile_url"
+    primary_error: str | None = None
+
+    try:
+        info = _extract_profile(profile_url, limit)
+        videos = _normalize_profile_entries(info, profile_url)
+    except Exception as exc:
+        primary_error = f"{type(exc).__name__}: {exc}"
+        videos = []
+
+    if not videos and seed_video_url:
+        channel_id = _channel_id_from_video(seed_video_url)
+        if not channel_id:
+            raise RuntimeError(
+                "Profile discovery failed and the seed video did not expose a TikTok channel_id. "
+                f"Primary error: {primary_error or 'empty profile result'}"
+            )
+        discovery_method = "seed_video_channel_id"
+        info = _extract_profile(f"tiktokuser:{channel_id}", limit)
+        videos = _normalize_profile_entries(info, profile_url)
+
+    if not videos and primary_error:
+        raise RuntimeError(
+            "TikTok profile discovery failed. Provide seed_video_url from the same creator so "
+            f"Tokisclone can resolve the secondary channel ID. Primary error: {primary_error}"
+        )
 
     inventory_path = out / "inventory.json"
     inventory_path.write_text(
@@ -145,6 +216,8 @@ def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
         "ok": True,
         "profile_url": profile_url,
         "count": len(videos),
+        "discovery_method": discovery_method,
+        "primary_error": primary_error,
         "file": inventory_path.name,
     }
 
@@ -164,6 +237,8 @@ def main() -> int:
     try:
         if kind == "diagnostic":
             result = diagnostic(job, out)
+        elif kind == "inspect":
+            result = inspect_url(job, out)
         elif kind == "video":
             result = download_video(job, out)
         elif kind == "profile":
