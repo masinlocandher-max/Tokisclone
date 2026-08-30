@@ -1,8 +1,16 @@
 # Tokisclone
 
-Tokisclone is a clean-room personal tool for public TikTok video archiving, metadata capture, optional transcription, and Google Drive storage.
+Tokisclone is a clean-room personal tool for public TikTok video archiving, bulk downloads, metadata capture, optional transcription, and Google Drive storage.
 
 It is not TokScript code and does not depend on TokScript.
+
+## MVP status
+
+The bulk-download MVP is implemented.
+
+Tokisclone can now take one creator/profile request or a list of video URLs, discover/deduplicate the batch, prefer a cleaner source rendition when the extractor exposes one, retry failures once, and produce a manifest. The personal worker can archive results directly to Google Drive.
+
+See [`BULK_MVP.md`](BULK_MVP.md) for job schemas and operational details.
 
 ## Recommended personal architecture
 
@@ -35,12 +43,29 @@ GitHub remains the source repository and CI system. GitHub-hosted runners are no
 Supported jobs:
 
 - `video` — save one public TikTok video to Drive
-- `profile` — discover a public TikTok profile and save new videos
+- `profile` / `bulk_profile` — discover a public TikTok profile and save new videos
+- `bulk_urls` — save many explicit TikTok URLs in one request
 - `diagnostic` — verify the Drive queue
 
-For each saved video, Tokisclone stores searchable Drive metadata including platform, creator, TikTok video ID, and source URL. Duplicate video IDs are skipped.
+For each saved video, Tokisclone stores searchable Drive metadata including platform, creator, TikTok video ID, source URL, and source-selection policy. Duplicate video IDs are skipped before download when possible.
 
-A profile sync can partially succeed. If 99 videos save and one fails, the job is still completed and the result reports the failed item instead of discarding the successful work.
+A bulk sync can partially succeed. If 99 videos save and one fails, the job still reports the 99 successes and the failed item instead of discarding completed work.
+
+## Cleaner-source selection
+
+The default is:
+
+```text
+TOKISCLONE_WATERMARK_POLICY=prefer-clean
+```
+
+Policies:
+
+- `prefer-clean` — prefer formats excluding TikTok's known marked `download` rendition, then use a generic fallback for compatibility.
+- `clean-only` — do not intentionally select that known marked rendition.
+- `allow` — normal best-format selection.
+
+Tokisclone does not blur, crop, or digitally erase watermarks. A genuinely clean result depends on what source renditions the platform exposes to the current session/region.
 
 ## Google Drive structure
 
@@ -55,9 +80,9 @@ Tokisclone/
 │   └── creator_name/
 │       ├── videos/
 │       ├── metadata/
-│       └── transcripts/       # only when requested
-├── Instagram/                 # reserved for future support
-├── YouTube/                   # reserved for future support
+│       └── transcripts/
+├── Instagram/
+├── YouTube/
 └── exports/
 ```
 
@@ -68,9 +93,10 @@ Requirements:
 - Python 3.12+
 - Git
 - your Google account
-- a Google Cloud OAuth Desktop client for Google Drive
+- Google Cloud OAuth Desktop client for Google Drive
+- FFmpeg recommended for media merging/conversion
 
-Clone the repository:
+Clone:
 
 ```bash
 git clone https://github.com/masinlocandher-max/Tokisclone.git
@@ -78,9 +104,7 @@ cd Tokisclone
 python -m venv .venv
 ```
 
-Activate the environment.
-
-macOS/Linux:
+Activate:
 
 ```bash
 source .venv/bin/activate
@@ -92,7 +116,7 @@ Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install the lightweight worker dependencies:
+Install the worker:
 
 ```bash
 pip install -r requirements-worker.txt
@@ -100,47 +124,25 @@ pip install -r requirements-worker.txt
 
 ### Google Drive authorization
 
-1. Create or use a Google Cloud project.
-2. Enable the Google Drive API.
-3. Configure the OAuth consent screen for your own Google account.
-4. Create an OAuth Client ID of type **Desktop app**.
-5. Download its JSON and save it locally in this repo as `client_secret.json`.
-
-Do not commit that file. It is excluded by `.gitignore`.
-
-Copy the environment template:
-
-```bash
-cp .env.example .env
-```
-
-On Windows, you can copy it in File Explorer or run:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Edit `.env` and set:
-
-```text
-GOOGLE_DRIVE_ROOT_FOLDER_ID=your_tokisclone_folder_id
-```
-
-Authorize once:
+1. Enable Google Drive API in your Google Cloud project.
+2. Configure OAuth consent for your own account.
+3. Create an OAuth Client ID of type **Desktop app**.
+4. Save the downloaded JSON locally as `client_secret.json`.
+5. Copy `.env.example` to `.env`.
+6. Set `GOOGLE_DRIVE_ROOT_FOLDER_ID`.
+7. Run:
 
 ```bash
 python authorize_drive.py
 ```
 
-A browser window opens for your Google authorization. The resulting `token.json` stays on your computer and is excluded from Git.
+The generated `token.json` stays local and is excluded from Git.
 
-Start the worker:
+Start:
 
 ```bash
 python local_worker.py
 ```
-
-When running, it checks the Drive Queue every 15 seconds by default.
 
 ## Job examples
 
@@ -151,36 +153,51 @@ Single video:
   "kind": "video",
   "platform": "tiktok",
   "url": "https://www.tiktok.com/@creator/video/123456789",
+  "watermark_policy": "prefer-clean",
   "transcribe": false
 }
 ```
 
-Profile sync:
+Bulk profile:
 
 ```json
 {
-  "kind": "profile",
+  "kind": "bulk_profile",
   "platform": "tiktok",
   "profile_url": "https://www.tiktok.com/@creator",
   "limit": 200,
   "download_new_only": true,
+  "watermark_policy": "prefer-clean",
+  "retry_failed_once": true,
   "transcribe": false
 }
 ```
 
-Put a job JSON file in `Tokisclone/Queue`. When the worker finishes, it moves the request plus a `.result.json` file to `Done`. Fatal errors go to `Failed`.
+Bulk URL list:
 
-When ChatGPT has access to your connected Google Drive, the JSON handoff can be created for you from the conversation, so normal use can be as simple as asking to save a TikTok video or sync a profile.
+```json
+{
+  "kind": "bulk_urls",
+  "platform": "tiktok",
+  "urls": [
+    "https://www.tiktok.com/@creator/video/123456789"
+  ],
+  "watermark_policy": "prefer-clean",
+  "retry_failed_once": true
+}
+```
+
+Put the JSON in `Tokisclone/Queue`. The worker moves completed requests and a `.result.json` file to `Done`. Fatal errors go to `Failed`.
 
 ## Optional transcription
 
-The lightweight worker installation does not install Whisper. If you want local transcription:
+Install:
 
 ```bash
 pip install faster-whisper
 ```
 
-Then submit jobs with:
+Then set:
 
 ```json
 {
@@ -188,25 +205,34 @@ Then submit jobs with:
 }
 ```
 
-The default local model is `small`. Change it in `.env` with `TOKISCLONE_WHISPER_MODEL`.
+The default model is `small`; configure `TOKISCLONE_WHISPER_MODEL` in `.env`.
 
 ## Optional TikTok cookies
 
-Public extraction normally does not require cookies. If TikTok asks for your normal logged-in session, Tokisclone can use your own exported Netscape-format `cookies.txt` file:
+If a normal logged-in session is required, Tokisclone can use your own exported Netscape-format cookies:
 
 ```text
 TOKISCLONE_COOKIE_FILE=cookies.txt
 ```
 
-Keep that file local. It is excluded from Git. Tokisclone does not attempt private-account access, CAPTCHA bypassing, DRM circumvention, credential theft, or anti-bot bypassing.
+Keep that file local. Tokisclone does not implement private-account access, CAPTCHA bypass, DRM circumvention, credential theft, or anti-bot bypass.
 
 ## GitHub Actions bridge
 
-`process_job.py` and `.github/workflows/process-jobs.yml` remain as a lightweight diagnostic/temporary worker path. They are useful for CI and sources that tolerate datacenter traffic, but they are not the primary TikTok profile worker.
+`process_job.py` and `.github/workflows/process-jobs.yml` can now execute:
+
+- `video`
+- `profile` (legacy inventory-only)
+- `bulk_profile`
+- `bulk_urls`
+- `inspect`
+- `diagnostic`
+
+GitHub Actions artifacts are temporary. The local Drive worker remains the recommended permanent personal archive because consumer social platforms can behave differently on datacenter IPs.
 
 ## Optional MCP mode
 
-The repository also contains a remote MCP implementation for environments where direct custom MCP integration is appropriate:
+The repository also contains the remote MCP implementation:
 
 - `server.py`
 - `drive_storage.py`
@@ -218,23 +244,21 @@ The Drive-queue local mode does not require MCP hosting.
 
 ## Reliability
 
-TikTok does not provide a general official API for enumerating arbitrary unrelated public accounts. Tokisclone therefore uses yt-dlp for best-effort public extraction. TikTok and extractor behavior can change, so keep yt-dlp current:
+TikTok does not provide a general official API for enumerating arbitrary unrelated public accounts. Tokisclone uses yt-dlp for best-effort public extraction. TikTok and extractor behavior can change, so keep yt-dlp current:
 
 ```bash
 pip install -U yt-dlp
 ```
 
-If profile discovery works in your browser but fails in Tokisclone, update yt-dlp first. Your own exported cookies can be supplied when a normal logged-in session is required.
+If ordinary TikTok profile discovery fails, a `seed_video_url` from the same creator can be supplied so Tokisclone can attempt the channel-ID fallback.
 
 ## Cost model
 
-Tokisclone has no TokScript subscription and no per-video Tokisclone licensing fee.
+Tokisclone has no TokScript subscription or per-video Tokisclone licensing fee.
 
-In personal mode, your practical costs are your existing Google Drive storage, internet bandwidth, and your own computer time. Transcription also uses local CPU/RAM.
+In personal mode, practical costs are Google Drive storage, bandwidth, and your own computer time. Local transcription also consumes CPU/RAM.
 
 ## Security
-
-This repository contains no Google OAuth token or Drive credentials.
 
 Never commit:
 
@@ -245,7 +269,7 @@ Never commit:
 - `cookies.txt`
 - downloaded private media
 
-Because this is intended as a personal tool, making the repository private is recommended even though the secret files are excluded.
+Making the repository private is recommended for a personal deployment.
 
 ## Rights
 
