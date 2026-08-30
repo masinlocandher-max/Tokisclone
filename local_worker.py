@@ -17,6 +17,7 @@ try:
 except ImportError:
     pass
 
+from dramafren_drive import archive_drama_to_drive
 from drive_storage import DriveStorage
 from media_core import (
     MANDATORY_SOURCE_POLICY,
@@ -59,7 +60,7 @@ def _require_tiktok_url(url: str) -> str:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or host not in ALLOWED_TIKTOK_HOSTS:
-        raise ValueError("Tokisclone local worker currently accepts TikTok URLs only.")
+        raise ValueError("TikTok job requires a TikTok URL.")
     return value
 
 
@@ -312,7 +313,6 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
     write_subtitles = bool(job.get("write_subtitles", False))
     retry_failed_once = bool(job.get("retry_failed_once", True))
 
-    # No profile limit is read here. One profile means all public videos.
     inventory_result = _profile_inventory(profile_url, seed_video_url)
     inventory = inventory_result["videos"]
 
@@ -529,8 +529,18 @@ def process_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
     kind = str(job.get("kind") or "").strip().lower()
     platform = str(job.get("platform") or "tiktok").strip().lower()
 
+    if kind in {"dramafren", "dramafren_drama"} or platform == "dramafren":
+        url = str(job.get("url") or job.get("profile_url") or "").strip()
+        if not url:
+            raise ValueError("dramafren job requires url")
+        return archive_drama_to_drive(
+            storage,
+            url,
+            retry_failed_once=bool(job.get("retry_failed_once", True)),
+        )
+
     if platform != "tiktok":
-        raise ValueError("The personal worker currently supports TikTok jobs only.")
+        raise ValueError("Personal worker supports TikTok and DramaFren jobs.")
 
     if kind == "video":
         return _process_video_job(storage, job)
@@ -547,7 +557,7 @@ def process_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
         }
 
     raise ValueError(
-        "Unsupported job kind. Use video, profile, bulk_profile, bulk_urls, or diagnostic."
+        "Unsupported job kind. Use video, profile, bulk_profile, bulk_urls, dramafren, or diagnostic."
     )
 
 
@@ -621,8 +631,9 @@ def main() -> None:
         "Press Ctrl+C to stop."
     )
     print(
-        "Source policy: clean-only (mandatory). "
-        "Profile scope: all public videos."
+        "TikTok source policy: clean-only (mandatory). "
+        "TikTok profile scope: all public videos. "
+        "DramaFren scope: all public episodes, direct non-DRM media only."
     )
 
     while not _STOP:
