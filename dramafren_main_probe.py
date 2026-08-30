@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Probe DramaFren's normally accessible player and copy public non-DRM media.
+"""Probe DramaFren's normally accessible player and preserve public media bytes.
 
-No CAPTCHA, Cloudflare, authentication, paywall, DRM, or encryption bypass is
-attempted. SAFE is returned only after a local media file is copied and passes
-ffprobe verification.
+No CAPTCHA, Cloudflare, authentication, paywall, DRM, encryption, or access-
+control bypass is attempted. The preferred proof path saves only bytes Chromium
+already received while playing the public page. SAFE is returned only when the
+browser-delivered response is the complete media object and ffprobe verifies it,
+or when a normal direct public request succeeds independently.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import json
 import os
 import re
 import sys
-import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +51,6 @@ COMMON_PLAY_SELECTORS = [
     "video",
 ]
 
-# Never persist or forward credentials. These are ordinary browser request
-# headers needed for public hotlink/referrer/range behavior only.
 FORWARDABLE_HEADERS = {
     "accept",
     "accept-language",
@@ -68,11 +67,34 @@ FORWARDABLE_HEADERS = {
 
 
 def safe_forward_headers(raw: dict[str, str]) -> dict[str, str]:
-    return {
-        key: value
-        for key, value in raw.items()
-        if key.lower() in FORWARDABLE_HEADERS
-    }
+    return {k: v for k, v in raw.items() if k.lower() in FORWARDABLE_HEADERS}
+
+
+def parse_content_range(value: str | None) -> dict[str, int] | None:
+    if not value:
+        return None
+    match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", value.strip(), re.I)
+    if not match or match.group(3) == "*":
+        return None
+    start, end, total = (int(match.group(i)) for i in (1, 2, 3))
+    return {"start": start, "end": end, "total": total}
+
+
+def response_is_complete(status: int, headers: dict[str, str], body_len: int) -> bool:
+    content_range = parse_content_range(headers.get("content-range"))
+    if content_range:
+        return (
+            content_range["start"] == 0
+            and content_range["end"] + 1 >= content_range["total"]
+            and body_len >= content_range["total"]
+        )
+    if status == 200:
+        try:
+            declared = int(headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        return declared == 0 or body_len >= declared
+    return False
 
 
 async def click_selector_in_scope(scope: Page | Frame, selector: str) -> bool:
@@ -97,8 +119,6 @@ async def click_player_controls(page: Page, log: list[dict[str, Any]]) -> bool:
                 })
                 return True
 
-    # Clicking the center of a visible embedded player is ordinary browser
-    # interaction, not an attempt to solve or evade a verification challenge.
     try:
         frames = page.locator("iframe")
         best = None
@@ -141,6 +161,8 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
 
     candidates: dict[str, dict[str, Any]] = {}
     log: list[dict[str, Any]] = []
+    response_tasks: list[asyncio.Task[Any]] = []
+    browser_complete_files: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
         launch: dict[str, Any] = {
@@ -166,30 +188,66 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         )
         page = await context.new_page()
 
-        async def on_response(response: Response) -> None:
+        async def handle_response(response: Response) -> None:
             try:
-                content_type = response.headers.get("content-type", "")
+                headers = await response.all_headers()
+                content_type = headers.get("content-type", "")
                 media_url = response.url
                 if not (
                     is_media_url(media_url)
                     or any(x in content_type.lower() for x in MEDIA_CONTENT_TYPES)
                 ):
                     return
+
                 request_headers = await response.request.all_headers()
-                source_frame = response.request.frame.url
-                candidates[media_url] = {
+                try:
+                    source_frame = response.request.frame.url
+                except Exception:
+                    source_frame = page.url
+
+                item: dict[str, Any] = {
                     "url": media_url,
                     "content_type": content_type,
                     "status": str(response.status),
                     "source": "network-response",
                     "source_frame": redact_url(source_frame),
-                    # Private runtime-only field. It is stripped from result.json.
+                    "content_length": headers.get("content-length"),
+                    "content_range": headers.get("content-range"),
+                    "accept_ranges": headers.get("accept-ranges"),
                     "_request_headers": safe_forward_headers(request_headers),
                 }
-            except Exception:
-                pass
+                candidates[media_url] = item
 
-        page.on("response", on_response)
+                # Preferred proof: save exactly the bytes Chromium already
+                # received. Never issue extra range requests to complete it.
+                if content_type.lower().startswith("video/") and response.status in (200, 206):
+                    try:
+                        await response.finished()
+                        body = await response.body()
+                        item["browser_body_bytes"] = len(body)
+                        complete = response_is_complete(response.status, headers, len(body))
+                        item["browser_body_complete"] = complete
+                        if complete and body:
+                            path = out_dir / f"browser-delivered-{len(browser_complete_files)+1}.mp4"
+                            path.write_bytes(body)
+                            verification = probe_media(path)
+                            item["browser_verification"] = verification
+                            if verification.get("verified"):
+                                browser_complete_files.append({
+                                    "path": path,
+                                    "url": media_url,
+                                    "verification": verification,
+                                    "bytes": len(body),
+                                })
+                    except Exception as exc:
+                        item["browser_body_error"] = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                log.append({"event": "response-handler-error", "error": f"{type(exc).__name__}: {exc}"})
+
+        def schedule_response(response: Response) -> None:
+            response_tasks.append(asyncio.create_task(handle_response(response)))
+
+        page.on("response", schedule_response)
 
         try:
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -206,56 +264,38 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 for frame in page.frames
                 if frame.url and frame.url != "about:blank"
             ]
-            log.append({
-                "event": "frames-before-play",
-                "count": len(before_frames),
-                "frames": before_frames[:20],
-            })
+            log.append({"event": "frames-before-play", "count": len(before_frames), "frames": before_frames[:20]})
 
             clicked = await click_player_controls(page, log)
             await page.wait_for_timeout(8000)
 
-            if not candidates:
+            if not any(candidate_priority(c["url"], c.get("content_type", "")) > 10 for c in candidates.values()):
                 for server in ("UPNShare", "Abyss"):
                     if await click_text(page, server):
                         log.append({"event": "server-select", "server": server})
                         await page.wait_for_timeout(4000)
                         await click_player_controls(page, log)
-                        await page.wait_for_timeout(8000)
-                        if candidates:
+                        await page.wait_for_timeout(10000)
+                        if any(candidate_priority(c["url"], c.get("content_type", "")) > 10 for c in candidates.values()):
                             break
 
-            try:
-                resources = await page.evaluate(
-                    "performance.getEntriesByType('resource').map(e => e.name)"
-                )
-                for media_url in resources:
-                    if is_media_url(media_url):
-                        candidates.setdefault(media_url, {
-                            "url": media_url,
-                            "content_type": "",
-                            "status": "",
-                            "source": "performance",
-                            "source_frame": redact_url(page.url),
-                            "_request_headers": {},
-                        })
-            except Exception:
-                pass
+            # Give media response handlers a chance to finish while Chromium is
+            # still open. They only read responses that the player already made.
+            await page.wait_for_timeout(3000)
+            if response_tasks:
+                await asyncio.gather(*list(response_tasks), return_exceptions=True)
 
             after_frames = [
                 redact_url(frame.url)
                 for frame in page.frames
                 if frame.url and frame.url != "about:blank"
             ]
-            log.append({
-                "event": "frames-after-play",
-                "count": len(after_frames),
-                "frames": after_frames[:20],
-            })
+            log.append({"event": "frames-after-play", "count": len(after_frames), "frames": after_frames[:20]})
             log.append({
                 "event": "final",
                 "candidate_count": len(candidates),
                 "clicked": clicked,
+                "browser_complete_file_count": len(browser_complete_files),
                 "title": await page.title(),
             })
             await page.screenshot(path=str(out_dir / "page.png"), full_page=True)
@@ -268,7 +308,7 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         reverse=True,
     )
 
-    public_candidates = []
+    public_candidates: list[dict[str, Any]] = []
     for candidate in ordered:
         public_candidates.append({
             key: (redact_url(value) if key == "url" else value)
@@ -277,11 +317,7 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         })
 
     result: dict[str, Any] = {
-        "job": {
-            "title": job.get("title"),
-            "detail_url": redact_url(url),
-            "episode": episode,
-        },
+        "job": {"title": job.get("title"), "detail_url": redact_url(url), "episode": episode},
         "status": "NOT_PROVEN",
         "browser_log": log,
         "candidate_count": len(ordered),
@@ -291,54 +327,66 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         "errors": [],
     }
 
-    base = out_dir / f"{slugify(str(job.get('title') or 'dramafren'))}-ep{episode:03d}.mp4"
+    # If Chromium itself received the whole object, that is sufficient proof.
+    if browser_complete_files:
+        proof = browser_complete_files[0]
+        final_name = f"{slugify(str(job.get('title') or 'dramafren'))}-ep{episode:03d}.mp4"
+        final_path = out_dir / final_name
+        proof["path"].replace(final_path)
+        result["download"] = {
+            "file": final_name,
+            "bytes": proof["bytes"],
+            "media_type": "browser-delivered-direct-video",
+            "source_url": redact_url(proof["url"]),
+            "verification": proof["verification"],
+        }
+        result["safe"] = True
+        result["status"] = "SAFE"
+    else:
+        # Secondary path for genuinely public media that permits a normal
+        # independent request. If the origin says 403, record it and stop.
+        base = out_dir / f"{slugify(str(job.get('title') or 'dramafren'))}-ep{episode:03d}.mp4"
+        for candidate in ordered:
+            media_url = candidate["url"]
+            content_type = candidate.get("content_type", "")
+            if candidate_priority(media_url, content_type) <= 10:
+                continue
 
-    for candidate in ordered:
-        media_url = candidate["url"]
-        content_type = candidate.get("content_type", "")
-        if candidate_priority(media_url, content_type) <= 10:
-            continue
+            captured_headers = dict(candidate.get("_request_headers") or {})
+            captured_headers.setdefault("range", "bytes=0-")
+            captured_headers.setdefault("accept", "*/*")
+            if not captured_headers.get("referer") and candidate.get("source_frame"):
+                captured_headers["referer"] = str(candidate["source_frame"])
 
-        captured_headers = dict(candidate.get("_request_headers") or {})
-        # For a browser media element, Range: bytes=0- is normal and may be
-        # required by the origin. It still retrieves the full resource to EOF.
-        captured_headers.setdefault("range", "bytes=0-")
-        captured_headers.setdefault("accept", "*/*")
-        if not captured_headers.get("referer") and candidate.get("source_frame"):
-            captured_headers["referer"] = str(candidate["source_frame"])
+            try:
+                if ".m3u8" in media_url.lower() or "mpegurl" in content_type.lower():
+                    download_hls(media_url, base, captured_headers)
+                    media_type = "hls-unencrypted"
+                else:
+                    download_direct(media_url, base, captured_headers)
+                    media_type = "direct-video"
 
-        try:
-            if ".m3u8" in media_url.lower() or "mpegurl" in content_type.lower():
-                download_hls(media_url, base, captured_headers)
-                media_type = "hls-unencrypted"
-            else:
-                download_direct(media_url, base, captured_headers)
-                media_type = "direct-video"
+                if base.exists() and base.stat().st_size > 0:
+                    verification = probe_media(base)
+                    result["download"] = {
+                        "file": base.name,
+                        "bytes": base.stat().st_size,
+                        "media_type": media_type,
+                        "source_url": redact_url(media_url),
+                        "verification": verification,
+                    }
+                    result["safe"] = bool(verification.get("verified"))
+                    result["status"] = "SAFE" if result["safe"] else "NOT_PROVEN"
+                    if result["safe"]:
+                        break
+            except Exception as exc:
+                result["errors"].append({
+                    "url": redact_url(media_url),
+                    "source_frame": candidate.get("source_frame"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
 
-            if base.exists() and base.stat().st_size > 0:
-                verification = probe_media(base)
-                result["download"] = {
-                    "file": base.name,
-                    "bytes": base.stat().st_size,
-                    "media_type": media_type,
-                    "source_url": redact_url(media_url),
-                    "verification": verification,
-                }
-                result["safe"] = bool(verification.get("verified"))
-                result["status"] = "SAFE" if result["safe"] else "NOT_PROVEN"
-                if result["safe"]:
-                    break
-        except Exception as exc:
-            result["errors"].append({
-                "url": redact_url(media_url),
-                "source_frame": candidate.get("source_frame"),
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-
-    (out_dir / "result.json").write_text(
-        json.dumps(result, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    (out_dir / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     return result
 
 
@@ -354,10 +402,7 @@ def main() -> int:
         print(json.dumps(result["download"], indent=2))
         return 0
 
-    print(
-        f"Result: {result.get('status')}; candidates={result.get('candidate_count')}",
-        file=sys.stderr,
-    )
+    print(f"Result: {result.get('status')}; candidates={result.get('candidate_count')}", file=sys.stderr)
     return 2
 
 
