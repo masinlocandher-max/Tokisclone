@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Probe DramaFren main-site embedded players for public, non-DRM media.
+"""Probe DramaFren's normally accessible player and copy public non-DRM media.
 
-This script does not bypass Cloudflare, CAPTCHA, authentication, paywalls, DRM,
-or encryption. It only interacts with visible player controls on a normally
-loaded public page, then verifies any copied media independently.
+No CAPTCHA, Cloudflare, authentication, paywall, DRM, or encryption bypass is
+attempted. SAFE is returned only after a local media file is copied and passes
+ffprobe verification.
 """
 
 from __future__ import annotations
@@ -50,6 +50,30 @@ COMMON_PLAY_SELECTORS = [
     "video",
 ]
 
+# Never persist or forward credentials. These are ordinary browser request
+# headers needed for public hotlink/referrer/range behavior only.
+FORWARDABLE_HEADERS = {
+    "accept",
+    "accept-language",
+    "cache-control",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "user-agent",
+}
+
+
+def safe_forward_headers(raw: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in raw.items()
+        if key.lower() in FORWARDABLE_HEADERS
+    }
+
 
 async def click_selector_in_scope(scope: Page | Frame, selector: str) -> bool:
     try:
@@ -63,22 +87,23 @@ async def click_selector_in_scope(scope: Page | Frame, selector: str) -> bool:
 
 
 async def click_player_controls(page: Page, log: list[dict[str, Any]]) -> bool:
-    # First try known player selectors in the main page and all child frames.
-    scopes: list[Page | Frame] = [page, *page.frames]
-    for scope in scopes:
+    for scope in [page, *page.frames]:
         for selector in COMMON_PLAY_SELECTORS:
             if await click_selector_in_scope(scope, selector):
-                log.append({"event": "player-click", "selector": selector, "frame": redact_url(scope.url)})
+                log.append({
+                    "event": "player-click",
+                    "selector": selector,
+                    "frame": redact_url(scope.url),
+                })
                 return True
 
-    # Then click the center of a visible iframe if present. This is equivalent
-    # to the user clicking the displayed embedded player, not a challenge.
+    # Clicking the center of a visible embedded player is ordinary browser
+    # interaction, not an attempt to solve or evade a verification challenge.
     try:
         frames = page.locator("iframe")
-        count = await frames.count()
         best = None
         best_area = 0.0
-        for i in range(count):
+        for i in range(await frames.count()):
             box = await frames.nth(i).bounding_box()
             if box:
                 area = float(box["width"] * box["height"])
@@ -86,31 +111,11 @@ async def click_player_controls(page: Page, log: list[dict[str, Any]]) -> bool:
                     best_area = area
                     best = box
         if best and best_area > 40000:
-            x = best["x"] + best["width"] / 2
-            y = best["y"] + best["height"] / 2
-            await page.mouse.click(x, y)
-            log.append({"event": "player-click", "selector": "largest-iframe-center", "area": int(best_area)})
-            return True
-    except Exception:
-        pass
-
-    # Finally find a large visible black/player-like element in the upper page
-    # and click its center. This only acts on the already-rendered public page.
-    try:
-        box = await page.evaluate("""
-        () => {
-          const els = Array.from(document.querySelectorAll('video, iframe, [class*=player], [id*=player], [class*=video]'));
-          const candidates = els.map(el => {
-            const r = el.getBoundingClientRect();
-            return {x:r.x,y:r.y,w:r.width,h:r.height,area:r.width*r.height};
-          }).filter(x => x.area > 40000 && x.y < 900 && x.w > 300 && x.h > 180)
-            .sort((a,b) => b.area-a.area);
-          return candidates[0] || null;
-        }
-        """)
-        if box:
-            await page.mouse.click(box["x"] + box["w"] / 2, box["y"] + box["h"] / 2)
-            log.append({"event": "player-click", "selector": "largest-player-center", "area": int(box["area"])})
+            await page.mouse.click(
+                best["x"] + best["width"] / 2,
+                best["y"] + best["height"] / 2,
+            )
+            log.append({"event": "player-click", "selector": "largest-iframe-center"})
             return True
     except Exception:
         pass
@@ -134,25 +139,27 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     timeout_ms = int(job.get("timeout_ms", 60000))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates: dict[str, dict[str, str]] = {}
+    candidates: dict[str, dict[str, Any]] = {}
     log: list[dict[str, Any]] = []
-    frame_urls: list[str] = []
-    user_agent = "Mozilla/5.0"
-    referer = url
-    cookie_header = ""
 
     async with async_playwright() as p:
         launch: dict[str, Any] = {
             "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"],
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--autoplay-policy=no-user-gesture-required",
+            ],
         }
         if os.environ.get("CHROME_BIN"):
             launch["executable_path"] = os.environ["CHROME_BIN"]
+
         browser = await p.chromium.launch(**launch)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1365, "height": 900},
             locale="en-US",
@@ -161,15 +168,24 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
 
         async def on_response(response: Response) -> None:
             try:
-                ct = response.headers.get("content-type", "")
+                content_type = response.headers.get("content-type", "")
                 media_url = response.url
-                if is_media_url(media_url) or any(x in ct.lower() for x in MEDIA_CONTENT_TYPES):
-                    candidates[media_url] = {
-                        "url": media_url,
-                        "content_type": ct,
-                        "status": str(response.status),
-                        "source": "network-response",
-                    }
+                if not (
+                    is_media_url(media_url)
+                    or any(x in content_type.lower() for x in MEDIA_CONTENT_TYPES)
+                ):
+                    return
+                request_headers = await response.request.all_headers()
+                source_frame = response.request.frame.url
+                candidates[media_url] = {
+                    "url": media_url,
+                    "content_type": content_type,
+                    "status": str(response.status),
+                    "source": "network-response",
+                    "source_frame": redact_url(source_frame),
+                    # Private runtime-only field. It is stripped from result.json.
+                    "_request_headers": safe_forward_headers(request_headers),
+                }
             except Exception:
                 pass
 
@@ -178,21 +194,27 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         try:
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             await page.wait_for_timeout(4000)
-            title = await page.title()
-            log.append({"event": "goto", "status": response.status if response else None, "title": title, "url": redact_url(page.url)})
+            log.append({
+                "event": "goto",
+                "status": response.status if response else None,
+                "title": await page.title(),
+                "url": redact_url(page.url),
+            })
 
-            # Record iframe topology without persisting query values.
-            for frame in page.frames:
-                if frame.url and frame.url != "about:blank":
-                    frame_urls.append(redact_url(frame.url))
-            log.append({"event": "frames-before-play", "count": len(frame_urls), "frames": frame_urls[:20]})
+            before_frames = [
+                redact_url(frame.url)
+                for frame in page.frames
+                if frame.url and frame.url != "about:blank"
+            ]
+            log.append({
+                "event": "frames-before-play",
+                "count": len(before_frames),
+                "frames": before_frames[:20],
+            })
 
-            # Try the visible player directly.
             clicked = await click_player_controls(page, log)
             await page.wait_for_timeout(8000)
 
-            # DramaFren visibly offers alternate player buttons. If the first
-            # player yielded nothing, switch using the UI exactly as a user can.
             if not candidates:
                 for server in ("UPNShare", "Abyss"):
                     if await click_text(page, server):
@@ -203,47 +225,63 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                         if candidates:
                             break
 
-            # DOM and resource entries may expose a direct public media URL.
             try:
-                sources = await page.eval_on_selector_all(
-                    "video, video source, source",
-                    "els => els.map(e => e.currentSrc || e.src || e.getAttribute('src')).filter(Boolean)",
+                resources = await page.evaluate(
+                    "performance.getEntriesByType('resource').map(e => e.name)"
                 )
-                for media_url in sources:
-                    absolute = urllib.parse.urljoin(page.url, media_url)
-                    if is_media_url(absolute):
-                        candidates.setdefault(absolute, {"url": absolute, "content_type": "", "status": "", "source": "dom"})
-            except Exception:
-                pass
-
-            try:
-                resources = await page.evaluate("performance.getEntriesByType('resource').map(e => e.name)")
                 for media_url in resources:
                     if is_media_url(media_url):
-                        candidates.setdefault(media_url, {"url": media_url, "content_type": "", "status": "", "source": "performance"})
+                        candidates.setdefault(media_url, {
+                            "url": media_url,
+                            "content_type": "",
+                            "status": "",
+                            "source": "performance",
+                            "source_frame": redact_url(page.url),
+                            "_request_headers": {},
+                        })
             except Exception:
                 pass
 
-            # Re-record frame URLs after player/server interaction.
-            after_frames = []
-            for frame in page.frames:
-                if frame.url and frame.url != "about:blank":
-                    after_frames.append(redact_url(frame.url))
-            log.append({"event": "frames-after-play", "count": len(after_frames), "frames": after_frames[:20]})
-            log.append({"event": "final", "candidate_count": len(candidates), "clicked": clicked, "title": await page.title()})
+            after_frames = [
+                redact_url(frame.url)
+                for frame in page.frames
+                if frame.url and frame.url != "about:blank"
+            ]
+            log.append({
+                "event": "frames-after-play",
+                "count": len(after_frames),
+                "frames": after_frames[:20],
+            })
+            log.append({
+                "event": "final",
+                "candidate_count": len(candidates),
+                "clicked": clicked,
+                "title": await page.title(),
+            })
             await page.screenshot(path=str(out_dir / "page.png"), full_page=True)
-
-            cookies = await context.cookies()
-            cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-            user_agent = await page.evaluate("navigator.userAgent")
-            referer = page.url
         finally:
             await browser.close()
 
-    ordered = sorted(candidates.values(), key=lambda c: candidate_priority(c["url"], c.get("content_type", "")), reverse=True)
-    public_candidates = [{**c, "url": redact_url(c["url"])} for c in ordered]
+    ordered = sorted(
+        candidates.values(),
+        key=lambda item: candidate_priority(item["url"], item.get("content_type", "")),
+        reverse=True,
+    )
+
+    public_candidates = []
+    for candidate in ordered:
+        public_candidates.append({
+            key: (redact_url(value) if key == "url" else value)
+            for key, value in candidate.items()
+            if not key.startswith("_")
+        })
+
     result: dict[str, Any] = {
-        "job": {"title": job.get("title"), "detail_url": redact_url(url), "episode": episode},
+        "job": {
+            "title": job.get("title"),
+            "detail_url": redact_url(url),
+            "episode": episode,
+        },
         "status": "NOT_PROVEN",
         "browser_log": log,
         "candidate_count": len(ordered),
@@ -253,23 +291,30 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         "errors": [],
     }
 
-    headers = {"User-Agent": user_agent, "Referer": referer, "Accept": "*/*"}
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-
     base = out_dir / f"{slugify(str(job.get('title') or 'dramafren'))}-ep{episode:03d}.mp4"
+
     for candidate in ordered:
         media_url = candidate["url"]
-        ct = candidate.get("content_type", "")
-        if candidate_priority(media_url, ct) <= 10:
+        content_type = candidate.get("content_type", "")
+        if candidate_priority(media_url, content_type) <= 10:
             continue
+
+        captured_headers = dict(candidate.get("_request_headers") or {})
+        # For a browser media element, Range: bytes=0- is normal and may be
+        # required by the origin. It still retrieves the full resource to EOF.
+        captured_headers.setdefault("range", "bytes=0-")
+        captured_headers.setdefault("accept", "*/*")
+        if not captured_headers.get("referer") and candidate.get("source_frame"):
+            captured_headers["referer"] = str(candidate["source_frame"])
+
         try:
-            if ".m3u8" in media_url.lower() or "mpegurl" in ct.lower():
-                download_hls(media_url, base, headers)
+            if ".m3u8" in media_url.lower() or "mpegurl" in content_type.lower():
+                download_hls(media_url, base, captured_headers)
                 media_type = "hls-unencrypted"
             else:
-                download_direct(media_url, base, headers)
+                download_direct(media_url, base, captured_headers)
                 media_type = "direct-video"
+
             if base.exists() and base.stat().st_size > 0:
                 verification = probe_media(base)
                 result["download"] = {
@@ -284,23 +329,35 @@ async def run(job: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 if result["safe"]:
                     break
         except Exception as exc:
-            result["errors"].append({"url": redact_url(media_url), "error": f"{type(exc).__name__}: {exc}"})
+            result["errors"].append({
+                "url": redact_url(media_url),
+                "source_frame": candidate.get("source_frame"),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
-    (out_dir / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "result.json").write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     return result
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("job")
-    ap.add_argument("--output", required=True)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("job")
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
     job = json.loads(Path(args.job).read_text(encoding="utf-8"))
     result = asyncio.run(run(job, Path(args.output)))
     if result.get("safe"):
         print(json.dumps(result["download"], indent=2))
         return 0
-    print(f"Result: {result.get('status')}; candidates={result.get('candidate_count')}", file=sys.stderr)
+
+    print(
+        f"Result: {result.get('status')}; candidates={result.get('candidate_count')}",
+        file=sys.stderr,
+    )
     return 2
 
 
