@@ -1,0 +1,67 @@
+name: Tokisclone Job
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install yt-dlp
+        run: pip install "yt-dlp>=2026.8.19"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Find submitted jobs
+        id: jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+            | grep -E '^jobs/.+\.json$' > /tmp/tokisclone-jobs.txt || true
+          if [ ! -s /tmp/tokisclone-jobs.txt ]; then
+            echo "No job JSON changed in this commit."
+            exit 1
+          fi
+          cat /tmp/tokisclone-jobs.txt
+
+      - name: Process jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          overall=0
+          while IFS= read -r job; do
+            name="$(basename "$job" .json)"
+            mkdir -p "output/$name"
+            if ! python process_job.py "$job" --output "output/$name"; then
+              overall=1
+            fi
+          done < /tmp/tokisclone-jobs.txt
+          exit "$overall"
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokisclone-${{ github.sha }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
