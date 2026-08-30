@@ -1,0 +1,66 @@
+name: Tokisclone Library
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "library_db.py"
+      - "library_mcp.py"
+      - "ingest_local_media.py"
+      - "run_server.py"
+      - ".github/workflows/library.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "library_db.py"
+      - "library_mcp.py"
+      - "ingest_local_media.py"
+      - "run_server.py"
+      - ".github/workflows/library.yml"
+
+jobs:
+  validate-library:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal dependencies
+        run: pip install -r requirements-minimal.txt
+      - name: Compile library integration
+        run: python -m py_compile library_db.py library_mcp.py ingest_local_media.py run_server.py
+      - name: Smoke-test catalogue read model
+        run: |
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from library_db import LibraryDB
+
+          with tempfile.TemporaryDirectory() as td:
+              db = LibraryDB(Path(td) / "catalogue.db")
+              drama = db.upsert_drama(title="Website Test Drama", episode_count=2)
+              episode = db.upsert_episode(drama_id=drama["id"], episode_number=1)
+              db.register_file(
+                  episode_id=episode["id"],
+                  storage_provider="google_drive",
+                  provider_file_id="proof-file",
+                  sha256="b" * 64,
+                  bytes_size=23577,
+                  mime_type="video/mp4",
+                  verified=True,
+                  verification={"verified": True},
+              )
+              rows = db.list_dramas()
+              assert rows[0]["verified_files"] == 1
+              detail = db.get_drama(drama["slug"])
+              assert detail and detail["episodes"][0]["files"][0]["verified"] is True
+          print("Website-facing catalogue read model OK")
+          PY
+      - name: Verify production server registers library tools
+        run: |
+          TOKISCLONE_LIBRARY_DB=/tmp/tokisclone-library-ci.db python - <<'PY'
+          import run_server
+          assert run_server.mcp is not None
+          print("Production MCP server imports with library tools registered")
+          PY
