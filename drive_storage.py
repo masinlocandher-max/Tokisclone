@@ -80,13 +80,13 @@ class DriveStorage:
             "youtube": "YouTube",
         }.get(platform.lower(), platform.title())
         platform_folder = self.ensure_folder(platform_name)
-        creator_folder = self.ensure_folder(creator, platform_folder["id"])
-        return creator_folder
+        return self.ensure_folder(creator, platform_folder["id"])
 
     def find_video(self, platform: str, video_id: str) -> dict[str, Any] | None:
         q = (
             "appProperties has { key='tokisclone' and value='1' } and "
-            f"appProperties has {{ key='platform' and value='{_escape(platform)}' }} and "
+            "appProperties has { key='kind' and value='video' } and "
+            f"appProperties has {{ key='platform' and value='{_escape(platform.lower())}' }} and "
             f"appProperties has {{ key='video_id' and value='{_escape(video_id)}' }} and "
             "trashed = false"
         )
@@ -94,7 +94,7 @@ class DriveStorage:
             q=q,
             spaces="drive",
             fields="files(id,name,mimeType,size,webViewLink,createdTime,appProperties,parents)",
-            pageSize=2,
+            pageSize=1,
         ).execute().get("files", [])
         return files[0] if files else None
 
@@ -176,8 +176,4 @@ class DriveStorage:
 
     def status(self) -> dict[str, Any]:
         root = self.get_file(self.root_folder_id)
-        return {
-            "connected": True,
-            "root_folder": root,
-            "scope": DRIVE_SCOPE,
-        }
+        return {"connected": True, "root_folder": root, "scope": DRIVE_SCOPE}
