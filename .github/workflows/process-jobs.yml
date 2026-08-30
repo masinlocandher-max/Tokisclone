@@ -22,11 +22,17 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install yt-dlp
-        run: pip install "yt-dlp>=2026.8.19"
+      - name: Install media dependencies
+        run: |
+          pip install "yt-dlp[default,curl-cffi]>=2026.8.19"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
 
-      - name: Verify ffmpeg
-        run: ffmpeg -version | head -n 1
+      - name: Verify media stack
+        run: |
+          yt-dlp --version
+          yt-dlp --list-impersonate-targets
+          ffmpeg -version | head -n 1
 
       - name: Find submitted jobs
         shell: bash
