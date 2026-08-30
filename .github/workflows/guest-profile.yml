@@ -1,0 +1,65 @@
+name: Tokisclone Guest Profile
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "guest-jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install guest browser transport
+        run: pip install "curl-cffi>=0.16,<0.17"
+
+      - name: Find submitted guest jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+            | grep -E '^guest-jobs/.+\.json$' > /tmp/tokisclone-guest-jobs.txt || true
+          if [ ! -s /tmp/tokisclone-guest-jobs.txt ]; then
+            echo "No guest job JSON changed in this commit."
+            exit 1
+          fi
+          cat /tmp/tokisclone-guest-jobs.txt
+
+      - name: Process guest profile jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          overall=0
+          while IFS= read -r job; do
+            name="$(basename "$job" .json)"
+            profile_url="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["profile_url"])' "$job")"
+            limit="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("limit",50))' "$job")"
+            mkdir -p "output/$name"
+            if ! python tiktok_guest.py "$profile_url" --limit "$limit" --output "output/$name"; then
+              overall=1
+            fi
+          done < /tmp/tokisclone-guest-jobs.txt
+          exit "$overall"
+
+      - name: Upload guest result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokisclone-guest-${{ github.sha }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
