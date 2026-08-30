@@ -9,47 +9,20 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-import yt_dlp
 from mcp.server.mcpserver import MCPServer
 
 from drive_storage import DriveStorage
+from media_core import (
+    MANDATORY_SOURCE_POLICY,
+    discover_profile,
+    download_one,
+    inspect_video_formats,
+)
 
 mcp = MCPServer("Tokisclone")
 TEMP_ROOT = Path(os.getenv("VIDEO_DOWNLOAD_DIR", "/tmp/tokisclone"))
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-
-
-def _clean_info(info: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": info.get("id"),
-        "url": info.get("webpage_url") or info.get("original_url"),
-        "title": info.get("title") or info.get("description"),
-        "description": info.get("description"),
-        "uploader": info.get("uploader"),
-        "uploader_id": info.get("uploader_id"),
-        "channel": info.get("channel"),
-        "duration": info.get("duration"),
-        "timestamp": info.get("timestamp"),
-        "upload_date": info.get("upload_date"),
-        "view_count": info.get("view_count"),
-        "like_count": info.get("like_count"),
-        "comment_count": info.get("comment_count"),
-        "repost_count": info.get("repost_count"),
-        "thumbnail": info.get("thumbnail"),
-        "tags": info.get("tags"),
-        "extractor": info.get("extractor"),
-    }
-
-
-def _ydl(extra: dict[str, Any] | None = None) -> yt_dlp.YoutubeDL:
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": False,
-    }
-    if extra:
-        opts.update(extra)
-    return yt_dlp.YoutubeDL(opts)
+COOKIE_FILE = os.getenv("TOKISCLONE_COOKIE_FILE")
 
 
 def _platform(url: str, extractor: str | None = None) -> str:
@@ -70,95 +43,19 @@ def _safe_name(value: str | None, fallback: str = "unknown") -> str:
 
 
 def _inspect_video(url: str) -> dict[str, Any]:
-    with _ydl({"noplaylist": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not isinstance(info, dict):
-        raise RuntimeError("No video metadata was returned.")
-    return _clean_info(info)
+    return inspect_video_formats(url, cookie_file=COOKIE_FILE)["video"]
 
 
-def _list_profile(profile_url: str, limit: int) -> dict[str, Any]:
-    if limit < 1:
-        raise ValueError("limit must be at least 1")
-    limit = min(limit, 500)
-
-    with _ydl(
-        {
-            "extract_flat": True,
-            "playlistend": limit,
-            "skip_download": True,
-        }
-    ) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
-
-    if not isinstance(info, dict):
-        raise RuntimeError("No profile data was returned.")
-
-    entries = info.get("entries") or []
-    results: list[dict[str, Any]] = []
-    username = profile_url.rstrip("/").split("/")[-1]
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        item_url = entry.get("webpage_url") or entry.get("url")
-        if (
-            item_url
-            and str(item_url).isdigit()
-            and "tiktok" in profile_url.lower()
-            and username.startswith("@")
-        ):
-            item_url = f"https://www.tiktok.com/{username}/video/{item_url}"
-
-        results.append(
-            {
-                "id": entry.get("id"),
-                "url": item_url,
-                "title": entry.get("title") or entry.get("description"),
-                "duration": entry.get("duration"),
-                "timestamp": entry.get("timestamp"),
-                "view_count": entry.get("view_count"),
-                "like_count": entry.get("like_count"),
-                "thumbnail": entry.get("thumbnail"),
-            }
-        )
-
-    return {
-        "profile_url": profile_url,
-        "count": len(results),
-        "videos": results,
-    }
+def _list_profile(profile_url: str) -> dict[str, Any]:
+    return discover_profile(profile_url, cookie_file=COOKIE_FILE)
 
 
 def _download_to(url: str, workdir: Path) -> tuple[Path, dict[str, Any]]:
-    outtmpl = str(workdir / "%(id)s.%(ext)s")
-
-    with _ydl(
-        {
-            "noplaylist": True,
-            "outtmpl": outtmpl,
-            "format": "bv*+ba/b",
-            "merge_output_format": "mp4",
-        }
-    ) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-    if not isinstance(info, dict):
-        raise RuntimeError("Download returned no metadata.")
-
-    video_id = str(info.get("id") or "")
-    candidates = [
-        p
-        for p in workdir.iterdir()
-        if p.is_file()
-        and not p.name.endswith((".part", ".ytdl"))
-        and (not video_id or p.stem.startswith(video_id))
-    ]
-    if not candidates:
-        raise RuntimeError("Downloaded media file could not be located.")
-
-    candidates.sort(key=lambda p: (p.suffix.lower() != ".mp4", -p.stat().st_size))
-    return candidates[0], _clean_info(info)
+    result = download_one(url, workdir, cookie_file=COOKIE_FILE)
+    media_files = [Path(p) for p in result.get("media_files") or []]
+    if not media_files:
+        raise RuntimeError("Download produced no media file.")
+    return media_files[0], result["metadata"]
 
 
 def _transcribe_media(
@@ -228,6 +125,7 @@ def _save_video_to_drive(
             "status": "already_saved",
             "metadata": metadata,
             "drive_file": existing,
+            "source_policy": MANDATORY_SOURCE_POLICY,
         }
 
     creator_root = storage.creator_folder(platform, creator)
@@ -246,6 +144,7 @@ def _save_video_to_drive(
             "video_id": video_id,
             "creator": creator,
             "source_url": url[:124],
+            "source_policy": MANDATORY_SOURCE_POLICY,
         }
 
         drive_file = storage.upload_file(
@@ -279,6 +178,7 @@ def _save_video_to_drive(
         "drive_file": drive_file,
         "transcript_file": transcript_file,
         "transcript": transcript,
+        "source_policy": MANDATORY_SOURCE_POLICY,
     }
 
 
@@ -289,12 +189,9 @@ def inspect_video(url: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_profile_videos(
-    profile_url: str,
-    limit: int = 50,
-) -> dict[str, Any]:
-    """Best-effort discovery of public videos from a creator/profile URL."""
-    return _list_profile(profile_url, limit)
+def list_profile_videos(profile_url: str) -> dict[str, Any]:
+    """Discover all public videos exposed from a creator/profile URL."""
+    return _list_profile(profile_url)
 
 
 @mcp.tool()
@@ -304,7 +201,7 @@ def save_video_to_drive(
     model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "small",
     language: str | None = None,
 ) -> dict[str, Any]:
-    """Save an authorized public video permanently to Google Drive and delete the temporary local copy."""
+    """Save a public/authorized video using mandatory clean-only source selection."""
     return _save_video_to_drive(
         DriveStorage(),
         url,
@@ -317,16 +214,10 @@ def save_video_to_drive(
 @mcp.tool()
 def sync_creator(
     profile_url: str,
-    limit: int = 50,
     transcribe: bool = False,
 ) -> dict[str, Any]:
-    """Discover a creator's public videos and save only videos missing from the Drive library."""
-    if limit > 100:
-        raise ValueError(
-            "Personal synchronous sync is capped at 100 videos per call."
-        )
-
-    profile = _list_profile(profile_url, limit)
+    """Discover all public videos from one profile and save every missing video."""
+    profile = _list_profile(profile_url)
     storage = DriveStorage()
     saved: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -390,6 +281,8 @@ def sync_creator(
 
     return {
         "profile_url": profile_url,
+        "scope": "all_public",
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "discovered": profile["count"],
         "saved": len(saved),
         "already_saved": len(skipped),
@@ -473,12 +366,7 @@ def get_bulk_metadata(urls: list[str]) -> dict[str, Any]:
         try:
             results.append(_inspect_video(url))
         except Exception as exc:
-            errors.append(
-                {
-                    "url": url,
-                    "error": str(exc),
-                }
-            )
+            errors.append({"url": url, "error": str(exc)})
 
     return {
         "requested": len(urls),
@@ -538,11 +426,13 @@ def drive_status() -> dict[str, Any]:
 
 @mcp.tool()
 def health() -> dict[str, Any]:
-    """Return Tokisclone server health and its personal-tool feature set."""
+    """Return Tokisclone server health and enforced product rules."""
     return {
         "ok": True,
         "name": "Tokisclone",
         "storage": "Google Drive",
+        "source_policy": MANDATORY_SOURCE_POLICY,
+        "profile_scope": "all_public",
         "tools": [
             "inspect_video",
             "list_profile_videos",
