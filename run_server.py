@@ -4,7 +4,10 @@ import os
 
 from mcp.server.transport_security import TransportSecuritySettings
 
+from library_mcp import register_library_tools
 from server import mcp
+
+register_library_tools(mcp)
 
 
 def _csv_env(name: str) -> list[str]:
