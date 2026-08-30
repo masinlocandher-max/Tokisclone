@@ -6,3 +6,6 @@ downloads/
 *.mp4
 *.wav
 *.webm
+token.json
+client_secret.json
+credentials.json
