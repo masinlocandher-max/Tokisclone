@@ -1,0 +1,33 @@
+name: Package Drama Local Job
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "drama-local-jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Find changed job
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+            | grep -E '^drama-local-jobs/.+\.json$' > /tmp/jobs.txt
+          cat /tmp/jobs.txt
+          mkdir -p packaged-job
+          while IFS= read -r job; do cp "$job" packaged-job/; done < /tmp/jobs.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drama-local-job-${{ github.sha }}
+          path: packaged-job/
+          retention-days: 1
+          compression-level: 0
