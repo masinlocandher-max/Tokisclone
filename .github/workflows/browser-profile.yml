@@ -1,0 +1,68 @@
+name: Tokisclone Browser Profile
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "browser-jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Playwright client
+        run: pip install "playwright>=1.55,<2"
+      - name: Locate Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "No system Chrome found; installing Playwright Chromium"
+            python -m playwright install --with-deps chromium
+          else
+            echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+            "$CHROME_BIN" --version
+          fi
+      - name: Find browser jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+            | grep -E '^browser-jobs/.+\.json$' > /tmp/browser-jobs.txt || true
+          test -s /tmp/browser-jobs.txt
+      - name: Run browser profile jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          overall=0
+          while IFS= read -r job; do
+            name="$(basename "$job" .json)"
+            profile_url="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["profile_url"])' "$job")"
+            limit="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("limit",50))' "$job")"
+            mkdir -p "output/$name"
+            if ! python tiktok_browser.py "$profile_url" --limit "$limit" --output "output/$name"; then
+              overall=1
+            fi
+          done < /tmp/browser-jobs.txt
+          exit "$overall"
+      - name: Upload browser artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokisclone-browser-${{ github.sha }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
