@@ -1,0 +1,11 @@
+{
+  "kind": "series",
+  "platform": "dramafren",
+  "detail_url": "https://dramabox.dramafren.org/index.php?page=detail&id=42000016298&lang=en&slug=here-comes-the-straight-a-mafia-boss",
+  "drama_id": "42000016298",
+  "lang": "en",
+  "title": "Here Comes the Straight-A Mafia Boss",
+  "scope": "all_public_episodes",
+  "retry_failed_once": true,
+  "storage": "google_drive"
+}
