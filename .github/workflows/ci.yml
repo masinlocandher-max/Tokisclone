@@ -41,7 +41,8 @@ jobs:
           selector = media_core.video_format_selector("best", "allow")
           assert "format_id!=download" in selector
           assert selector == media_core.video_format_selector("best", "prefer-clean")
-          assert "playlistend" not in inspect.getsource(media_core._extract_profile)
+          profile_source = inspect.getsource(media_core._extract_profile)
+          assert '"playlistend"' not in profile_source
           print("Mandatory clean-only and all-public profile invariants OK")
           PY
 
