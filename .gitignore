@@ -11,3 +11,6 @@ client_secret.json
 credentials.json
 cookies.txt
 *.cookies.txt
+*.db
+*.db-wal
+*.db-shm
