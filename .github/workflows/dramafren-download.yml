@@ -38,11 +38,12 @@ jobs:
             "$CHROME_BIN" --version
           fi
 
-      - name: Locate ffmpeg
+      - name: Check ffmpeg
         shell: bash
         run: |
           set -euo pipefail
-          ffmpeg -version | head -n 1
+          command -v ffmpeg
+          ffmpeg -version >/dev/null
 
       - name: Find changed drama jobs
         shell: bash
