@@ -18,6 +18,8 @@ jobs:
       - name: Install validation dependencies
         run: pip install -r requirements-minimal.txt
       - name: Compile Python
-        run: python -m py_compile server.py drive_storage.py authorize_drive.py run_server.py
+        run: python -m py_compile server.py drive_storage.py authorize_drive.py run_server.py process_job.py local_worker.py
       - name: Import and smoke-test MCP server
         run: python -c "import server; assert server.health()['ok']; print('Tokisclone MCP import and health OK')"
+      - name: Import local worker
+        run: python -c "import local_worker; print('Tokisclone local worker import OK')"
