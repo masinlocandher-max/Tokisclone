@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,38 @@ def diagnostic(job: dict[str, Any], out: Path) -> dict[str, Any]:
     path = out / "diagnostic.txt"
     path.write_text(text + "\n", encoding="utf-8")
     return {"kind": "diagnostic", "ok": True, "file": path.name}
+
+
+def tikdata_probe(job: dict[str, Any], out: Path) -> dict[str, Any]:
+    """Fetch the advertised OpenAPI schema from the fixed public TikTok API host."""
+    url = "https://api.tik-data.com/api/openapi.json"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Tokisclone/1.0 (+personal research tool)",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read()
+        status = int(getattr(response, "status", 200))
+        content_type = response.headers.get("content-type")
+
+    spec = json.loads(raw.decode("utf-8"))
+    path = out / "tikdata-openapi.json"
+    path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    paths = sorted((spec.get("paths") or {}).keys())
+    return {
+        "kind": "tikdata_probe",
+        "ok": True,
+        "status": status,
+        "content_type": content_type,
+        "title": (spec.get("info") or {}).get("title"),
+        "version": (spec.get("info") or {}).get("version"),
+        "paths": paths,
+        "file": path.name,
+    }
 
 
 def inspect_url(job: dict[str, Any], out: Path) -> dict[str, Any]:
@@ -237,6 +270,8 @@ def main() -> int:
     try:
         if kind == "diagnostic":
             result = diagnostic(job, out)
+        elif kind == "tikdata_probe":
+            result = tikdata_probe(job, out)
         elif kind == "inspect":
             result = inspect_url(job, out)
         elif kind == "video":
