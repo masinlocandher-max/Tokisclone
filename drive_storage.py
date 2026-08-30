@@ -9,7 +9,7 @@ from typing import Any
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -82,6 +82,51 @@ class DriveStorage:
         platform_folder = self.ensure_folder(platform_name)
         return self.ensure_folder(creator, platform_folder["id"])
 
+    def creator_subfolder(self, platform: str, creator: str, name: str) -> dict[str, Any]:
+        creator_folder = self.creator_folder(platform, creator)
+        return self.ensure_folder(name, creator_folder["id"])
+
+    def list_children(
+        self,
+        parent_id: str,
+        *,
+        name_suffix: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 1000))
+        q = f"'{_escape(parent_id)}' in parents and trashed = false"
+        response = self.service.files().list(
+            q=q,
+            spaces="drive",
+            orderBy="createdTime asc",
+            pageSize=limit,
+            fields="files(id,name,mimeType,size,webViewLink,createdTime,modifiedTime,appProperties,parents)",
+        ).execute()
+        items = response.get("files", [])
+        if name_suffix:
+            items = [item for item in items if item.get("name", "").endswith(name_suffix)]
+        return items
+
+    def download_bytes(self, file_id: str) -> bytes:
+        request = self.service.files().get_media(fileId=file_id)
+        stream = io.BytesIO()
+        downloader = MediaIoBaseDownload(stream, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return stream.getvalue()
+
+    def download_text(self, file_id: str) -> str:
+        return self.download_bytes(file_id).decode("utf-8")
+
+    def move_file(self, file_id: str, *, from_parent: str, to_parent: str) -> dict[str, Any]:
+        return self.service.files().update(
+            fileId=file_id,
+            addParents=to_parent,
+            removeParents=from_parent,
+            fields="id,name,mimeType,size,webViewLink,createdTime,modifiedTime,appProperties,parents",
+        ).execute()
+
     def find_video(self, platform: str, video_id: str) -> dict[str, Any] | None:
         q = (
             "appProperties has { key='tokisclone' and value='1' } and "
@@ -127,9 +172,10 @@ class DriveStorage:
         parent_id: str,
         name: str,
         properties: dict[str, str] | None = None,
+        mime_type: str = "text/plain",
     ) -> dict[str, Any]:
         stream = io.BytesIO(text.encode("utf-8"))
-        media = MediaIoBaseUpload(stream, mimetype="text/plain", resumable=False)
+        media = MediaIoBaseUpload(stream, mimetype=mime_type, resumable=False)
         body = {
             "name": name,
             "parents": [parent_id],
@@ -140,6 +186,22 @@ class DriveStorage:
             media_body=media,
             fields="id,name,mimeType,size,webViewLink,createdTime,appProperties,parents",
         ).execute()
+
+    def upload_json(
+        self,
+        value: Any,
+        *,
+        parent_id: str,
+        name: str,
+        properties: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self.upload_text(
+            json.dumps(value, ensure_ascii=False, indent=2),
+            parent_id=parent_id,
+            name=name,
+            properties=properties,
+            mime_type="application/json",
+        )
 
     def list_library(
         self,
