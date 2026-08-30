@@ -1,60 +1,55 @@
 # Bulk Download MVP
 
-Tokisclone's MVP bulk flow is implemented in both the GitHub Actions worker and the personal Google Drive local worker.
+Tokisclone's bulk MVP follows two fixed product rules:
 
-## Goal
+- **Source policy: `clean-only`**
+- **Profile scope: `all_public`**
+
+Neither is configurable by a job.
+
+## Profile flow
 
 ```text
-creator/profile URL
+one creator/profile URL
         ↓
-discover public videos
+discover every public video the extractor can enumerate
         ↓
 deduplicate
         ↓
-prefer cleaner source rendition
+skip already archived IDs when possible
+        ↓
+strict clean-only source selection
         ↓
 download
         ↓
-retry failed items once
+retry failures once
         ↓
 manifest / per-item results
         ↓
 optional Drive archive and transcription
 ```
 
-## Source policy
+A profile job does not need `limit`, `max_items`, or `watermark_policy`.
 
-Jobs accept:
+## Clean-only rule
 
-```json
-{
-  "watermark_policy": "prefer-clean"
-}
-```
+Tokisclone excludes TikTok's known marked `download` rendition from its format selector and does not add a generic marked fallback. It also checks returned format metadata and rejects a result identified as watermarked.
 
-Allowed values:
+Tokisclone does not blur, crop, paint over, or digitally erase a burned-in watermark. If a clean source is not available to the current extractor/session, that item should fail rather than be silently saved as a marked video.
 
-- `prefer-clean` — first prefer formats excluding TikTok's known `download` rendition, then use a generic fallback if required for compatibility.
-- `clean-only` — do not intentionally select that known marked rendition.
-- `allow` — normal best-format selection.
-
-Tokisclone does not blur, crop, paint over, or otherwise erase an already burned-in watermark. A clean result depends on the source formats the platform exposes to the current session/region.
-
-## GitHub Actions bulk profile job
-
-Create a job under `jobs/`:
+## GitHub Actions profile job
 
 ```json
 {
-  "kind": "bulk_profile",
+  "kind": "profile",
   "profile_url": "https://www.tiktok.com/@creator",
-  "limit": 200,
-  "watermark_policy": "prefer-clean",
   "quality": "best",
   "write_subtitles": false,
   "retry_failed_once": true
 }
 ```
+
+`bulk_profile` is accepted as an alias with identical behavior.
 
 The Actions artifact contains:
 
@@ -68,64 +63,62 @@ downloads/
 result.json
 ```
 
-The legacy `profile` job remains inventory-only for compatibility.
-
-## GitHub Actions bulk URL job
+## Personal Drive worker profile job
 
 ```json
 {
-  "kind": "bulk_urls",
-  "urls": [
-    "https://www.tiktok.com/@creator/video/...",
-    "https://www.youtube.com/shorts/..."
-  ],
-  "max_items": 500,
-  "watermark_policy": "prefer-clean",
-  "retry_failed_once": true
-}
-```
-
-The Actions worker can process platforms supported by the active yt-dlp extractor. Datacenter IP restrictions can still affect platform reliability.
-
-## Personal Drive worker
-
-The personal `local_worker.py` remains TikTok-focused and writes directly to the owner's Google Drive library.
-
-Bulk profile:
-
-```json
-{
-  "kind": "bulk_profile",
+  "kind": "profile",
   "platform": "tiktok",
   "profile_url": "https://www.tiktok.com/@creator",
-  "limit": 200,
-  "download_new_only": true,
-  "watermark_policy": "prefer-clean",
   "retry_failed_once": true,
   "transcribe": false
 }
 ```
 
-Bulk URLs:
+The worker checks known video IDs against the Drive library before downloading, so already archived items can be skipped without wasting bandwidth.
+
+It stores:
+
+- videos
+- normalized metadata
+- latest profile inventory
+- latest bulk manifest
+- optional transcripts
+
+## Explicit URL batch
 
 ```json
 {
   "kind": "bulk_urls",
   "platform": "tiktok",
   "urls": [
+    "https://www.tiktok.com/@creator/video/...",
     "https://www.tiktok.com/@creator/video/..."
   ],
-  "watermark_policy": "prefer-clean",
   "retry_failed_once": true
 }
 ```
 
-The Drive worker checks video IDs before download where possible, so already archived videos are skipped without wasting bandwidth.
+All supplied valid URLs are deduplicated and processed. The same clean-only rule is mandatory.
+
+## MCP behavior
+
+`list_profile_videos(profile_url)` returns the complete public profile inventory discovered by the active extractor.
+
+`sync_creator(profile_url)` attempts to save the complete discovered public profile while skipping videos already present in Drive.
+
+There is no profile limit parameter and no watermark-policy parameter on these MCP tools.
 
 ## TikTok profile fallback
 
-Both paths accept an optional `seed_video_url` from the same creator. When ordinary TikTok profile discovery fails but the video exposes a channel ID, Tokisclone attempts the `tiktokuser:<channel_id>` extractor route.
+Queue/Actions profile jobs may include an optional `seed_video_url` from the same creator. If ordinary TikTok profile discovery fails and the seed exposes a channel ID, Tokisclone attempts the `tiktokuser:<channel_id>` route.
+
+## What "all public videos" means
+
+It means every public video that the current yt-dlp extractor and current network/session can successfully enumerate from the supplied profile at run time.
+
+It does not include private, deleted, region-blocked, age-restricted, login-inaccessible, or otherwise unavailable videos.
 
 ## Operational reality
 
-This is an MVP, not a promise that TikTok, Instagram, or YouTube will always expose the same endpoints. Keep yt-dlp current and use only public media or media you are authorized to access.
+TikTok and other platforms can change their web behavior. Keep yt-dlp current and use only public media or media you are authorized to process.
