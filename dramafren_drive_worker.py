@@ -5,6 +5,11 @@ Runs on the owner's computer with a persistent, headed Chrome profile. If
 Cloudflare asks for human verification, the owner completes it manually in the
 opened browser. The worker never clicks/bypasses CAPTCHAs and refuses encrypted
 HLS (#EXT-X-KEY) or DASH/DRM-like delivery.
+
+Queue jobs may target one episode or a whole public series. A ``kind=series``
+job discovers every publicly listed episode, skips episodes already stored in
+Drive, retries failed episodes once by default, and writes a full-series
+manifest.
 """
 
 from __future__ import annotations
@@ -347,12 +352,46 @@ def process_queue_once(storage: DriveStorage, profile_dir: Path) -> int:
             job = json.loads(storage.download_text(job_id))
             if str(job.get("platform") or "").lower() != "dramafren":
                 raise ValueError("This queue accepts platform=dramafren jobs only.")
-            if str(job.get("kind") or "episode").lower() != "episode":
-                raise ValueError("The first worker version accepts kind=episode jobs only.")
-            with tempfile.TemporaryDirectory(prefix="dramafren-") as td:
-                result = asyncio.run(resolve_episode(job, Path(td), profile_dir))
-                uploaded = upload_result(storage, job, result)
-                final = {"ok": True, "job": job, "result": result, "uploaded": uploaded}
+
+            kind = str(job.get("kind") or "episode").strip().lower()
+            if kind == "episode":
+                with tempfile.TemporaryDirectory(prefix="dramafren-") as td:
+                    result = asyncio.run(resolve_episode(job, Path(td), profile_dir))
+                    uploaded = upload_result(storage, job, result)
+                    final = {
+                        "ok": True,
+                        "kind": "episode",
+                        "job": job,
+                        "result": result,
+                        "uploaded": uploaded,
+                    }
+            elif kind in {"series", "bulk_series", "full_series"}:
+                # Lazy import avoids a module-level cycle because dramafren_bulk
+                # deliberately reuses resolve_episode/upload_result from here.
+                from dramafren_bulk import run_bulk
+
+                detail_url = validate_url(str(job.get("detail_url") or job.get("url") or ""))
+                verification_timeout = int(job.get("verification_timeout", 300))
+                retry_failed_once = bool(job.get("retry_failed_once", True))
+                summary = run_bulk(
+                    detail_url,
+                    storage,
+                    profile_dir,
+                    verification_timeout=verification_timeout,
+                    retry_failed_once=retry_failed_once,
+                )
+                final = {
+                    "ok": summary.get("failed", 0) == 0,
+                    "kind": "series",
+                    "job": job,
+                    "summary": summary,
+                }
+                if not final["ok"]:
+                    destination = failed["id"]
+            else:
+                raise ValueError(
+                    "Unsupported DramaFren job kind. Use episode or series."
+                )
         except Exception as exc:
             destination = failed["id"]
             final = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -369,7 +408,9 @@ def process_queue_once(storage: DriveStorage, profile_dir: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Process public DramaFren episode jobs from Google Drive.")
+    parser = argparse.ArgumentParser(
+        description="Process public DramaFren episode or full-series jobs from Google Drive."
+    )
     parser.add_argument("--root-folder-id", default=os.getenv("SHORT_DRAMA_DRIVE_ROOT_FOLDER_ID"))
     parser.add_argument("--profile-dir", default=os.getenv("DRAMAFREN_BROWSER_PROFILE", str(Path.home() / ".tokisclone" / "dramafren-browser")))
     parser.add_argument("--once", action="store_true", help="Process current queue once and exit.")
@@ -381,7 +422,7 @@ def main() -> int:
     profile_dir = Path(args.profile_dir).expanduser()
     profile_dir.mkdir(parents=True, exist_ok=True)
     storage = DriveStorage(root_folder_id=args.root_folder_id)
-    print("DramaFren Drive worker ready.")
+    print("DramaFren Drive worker ready for episode and full-series jobs.")
     print("A Chrome window may open for manual Cloudflare verification. The worker does not bypass it.")
 
     if args.once:
