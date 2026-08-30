@@ -1,0 +1,79 @@
+name: DramaFren Public Download
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "drama-jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Playwright
+        run: pip install "playwright>=1.55,<2"
+
+      - name: Locate or install Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            python -m playwright install --with-deps chromium
+          else
+            echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+            "$CHROME_BIN" --version
+          fi
+
+      - name: Locate ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -version | head -n 1
+
+      - name: Find changed drama jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+            | grep -E '^drama-jobs/.+\.json$' > /tmp/drama-jobs.txt || true
+          test -s /tmp/drama-jobs.txt
+          cat /tmp/drama-jobs.txt
+
+      - name: Resolve public media
+        shell: bash
+        run: |
+          set -u
+          overall=0
+          while IFS= read -r job; do
+            name="$(basename "$job" .json)"
+            mkdir -p "output/$name"
+            if ! python dramafren_browser.py "$job" --output "output/$name"; then
+              overall=1
+            fi
+          done < /tmp/drama-jobs.txt
+          exit "$overall"
+
+      - name: Upload resolver artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dramafren-${{ github.sha }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
