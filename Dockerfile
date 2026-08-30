@@ -7,9 +7,10 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m playwright install --with-deps chromium
 
-COPY server.py drive_storage.py run_server.py ./
+COPY server.py drive_storage.py run_server.py media_core.py dramafren_adapter.py dramafren_drive.py ./
 
 ENV VIDEO_DOWNLOAD_DIR=/tmp/tokisclone
 ENV HOST=0.0.0.0
