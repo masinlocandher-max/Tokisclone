@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+load_dotenv()
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -24,7 +27,6 @@ def main() -> None:
 
     print(f"Saved OAuth token to {token_file}")
     print("Keep this file private. Never commit it to GitHub.")
-    print("For deployment, store its JSON contents in the GOOGLE_DRIVE_TOKEN_JSON secret.")
 
 
 if __name__ == "__main__":
