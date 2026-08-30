@@ -27,6 +27,7 @@ jobs:
           drive_storage.py
           authorize_drive.py
           run_server.py
+          start_worker.py
           media_core.py
           process_job.py
           local_worker.py
@@ -74,5 +75,10 @@ jobs:
           print("Tokisclone MCP import and health OK")
           PY
 
-      - name: Import local worker
-        run: python -c "import local_worker; print('Tokisclone local worker + DramaFren integration import OK')"
+      - name: Import local worker and launcher
+        run: |
+          python - <<'PY'
+          import local_worker
+          import start_worker
+          print("Tokisclone local worker + launcher + DramaFren integration import OK")
+          PY
