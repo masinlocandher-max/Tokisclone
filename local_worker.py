@@ -17,6 +17,7 @@ try:
 except ImportError:
     pass
 
+from dramafren_queue import process_dramafren_queue_job
 from drive_storage import DriveStorage
 from media_core import (
     MANDATORY_SOURCE_POLICY,
@@ -59,7 +60,7 @@ def _require_tiktok_url(url: str) -> str:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or host not in ALLOWED_TIKTOK_HOSTS:
-        raise ValueError("Tokisclone local worker currently accepts TikTok URLs only.")
+        raise ValueError("TikTok job requires a TikTok URL.")
     return value
 
 
@@ -312,7 +313,6 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
     write_subtitles = bool(job.get("write_subtitles", False))
     retry_failed_once = bool(job.get("retry_failed_once", True))
 
-    # No profile limit is read here. One profile means all public videos.
     inventory_result = _profile_inventory(profile_url, seed_video_url)
     inventory = inventory_result["videos"]
 
@@ -529,8 +529,11 @@ def process_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
     kind = str(job.get("kind") or "").strip().lower()
     platform = str(job.get("platform") or "tiktok").strip().lower()
 
+    if kind in {"dramafren", "dramafren_drama", "drama"} or platform == "dramafren":
+        return process_dramafren_queue_job(storage, job)
+
     if platform != "tiktok":
-        raise ValueError("The personal worker currently supports TikTok jobs only.")
+        raise ValueError("Personal worker supports TikTok and DramaFren jobs.")
 
     if kind == "video":
         return _process_video_job(storage, job)
@@ -547,7 +550,7 @@ def process_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
         }
 
     raise ValueError(
-        "Unsupported job kind. Use video, profile, bulk_profile, bulk_urls, or diagnostic."
+        "Unsupported job kind. Use video, profile, bulk_profile, bulk_urls, dramafren, or diagnostic."
     )
 
 
@@ -621,8 +624,9 @@ def main() -> None:
         "Press Ctrl+C to stop."
     )
     print(
-        "Source policy: clean-only (mandatory). "
-        "Profile scope: all public videos."
+        "TikTok: clean-only, all public videos. "
+        "DramaFren: one drama URL -> all public listed episodes; "
+        "direct video or unencrypted HLS only."
     )
 
     while not _STOP:

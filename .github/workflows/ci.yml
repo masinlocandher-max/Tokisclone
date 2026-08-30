@@ -30,6 +30,9 @@ jobs:
           media_core.py
           process_job.py
           local_worker.py
+          dramafren_drive_worker.py
+          dramafren_bulk.py
+          dramafren_queue.py
 
       - name: Smoke-test product invariants
         run: |
@@ -46,6 +49,20 @@ jobs:
           print("Mandatory clean-only and all-public profile invariants OK")
           PY
 
+      - name: Smoke-test DramaFren unified queue
+        run: |
+          python - <<'PY'
+          from dramafren_queue import canonical_detail_url
+
+          source = "https://dramabox.dramafren.org/index.php?ep=12&id=42000005228&lang=en&view=watch"
+          detail = canonical_detail_url(source)
+          assert "id=42000005228" in detail
+          assert "lang=en" in detail
+          assert "view=detail" in detail
+          assert "ep=" not in detail
+          print("DramaFren queue URL normalization OK")
+          PY
+
       - name: Import and smoke-test MCP server
         run: |
           python - <<'PY'
@@ -58,4 +75,4 @@ jobs:
           PY
 
       - name: Import local worker
-        run: python -c "import local_worker; print('Tokisclone local worker import OK')"
+        run: python -c "import local_worker; print('Tokisclone local worker + DramaFren integration import OK')"

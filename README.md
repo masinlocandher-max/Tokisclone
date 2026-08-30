@@ -1,21 +1,29 @@
 # Tokisclone
 
-Tokisclone is a clean-room personal tool for public TikTok video archiving, bulk downloads, metadata capture, optional transcription, and Google Drive storage.
+Tokisclone is a clean-room personal media archiving tool for public TikTok videos and public DramaFren episodes, with bulk processing, Google Drive storage, metadata, retries, deduplication, and optional TikTok transcription.
 
 It does not use TokScript code and does not depend on TokScript.
 
 ## Product rules
 
-Two rules are now mandatory and are not user-configurable:
+### TikTok
 
-1. **Clean-only source selection.** Tokisclone never intentionally selects TikTok's known marked `download` rendition. There is no `prefer-clean` or `allow` mode anymore.
+Two rules are mandatory and are not user-configurable:
+
+1. **Clean-only source selection.** Tokisclone never intentionally selects TikTok's known marked `download` rendition. There is no `prefer-clean` or `allow` mode.
 2. **One profile URL means all public videos.** Profile jobs do not use a video limit. Tokisclone asks the active extractor to enumerate every public video it can see for that profile, deduplicates the results, and processes the complete discovered set.
 
-Legacy job fields such as `watermark_policy`, `limit`, or `max_items` may still exist in old queued JSON for compatibility, but they cannot relax these rules.
+Legacy TikTok job fields such as `watermark_policy`, `limit`, or `max_items` may still exist in old queued JSON for compatibility, but they cannot relax these rules.
 
-Tokisclone does not blur, crop, paint over, or digitally erase a watermark that is already burned into a file. If the available source is identified as watermarked, the strict downloader rejects it rather than pretending the output is clean.
+### DramaFren
 
-See [`BULK_MVP.md`](BULK_MVP.md) for the bulk job flow.
+DramaFren follows a parallel all-content rule:
+
+1. **One DramaFren title or watch URL means all public listed episodes for that drama.** Tokisclone extracts the drama `id`, normalizes the URL to the public detail page, reads the complete public episode list, then processes the full set.
+2. **Public direct video or unencrypted HLS only.** The resolver refuses encrypted HLS and does not bypass DRM, authentication, paywalls, CAPTCHA, or access controls.
+3. **Human verification stays human.** If the ordinary DramaFren page asks for Cloudflare verification, Tokisclone opens its persistent Chrome profile and waits for the owner to complete the verification manually. It never solves or clicks the challenge automatically.
+
+Tokisclone does not blur, crop, paint over, or digitally erase burned-in watermarks.
 
 ## Recommended personal architecture
 
@@ -28,31 +36,34 @@ Google Drive / Tokisclone / Queue
  ↓
 local_worker.py on your own computer and normal internet connection
  ↓
-TikTok public content
+TikTok or DramaFren public content
  ↓
-Google Drive / Tokisclone / TikTok / <creator>
+Google Drive permanent archive
  ↓
-Done or Failed result
+Done / Failed result + manifest
 ```
 
-ChatGPT can be the conversational interface. Google Drive is the queue and permanent library. Your own computer provides temporary media-processing compute, so an always-on paid server is not required for the personal setup.
+ChatGPT can be the conversational interface. Google Drive is the queue and permanent library. Your computer provides the temporary media-processing compute, so an always-on paid server is not required for the personal setup.
 
-GitHub remains the source repository and CI system. GitHub-hosted runners are a secondary processing route because social platforms can behave differently on datacenter IPs.
+GitHub remains the source repository and CI system. GitHub-hosted runners are a secondary processing route because consumer media sites can behave differently on datacenter IPs.
 
-## What the worker does
-
-Supported personal jobs:
+## Supported personal queue jobs
 
 - `video` — save one public TikTok video
 - `profile` / `bulk_profile` — discover and save all public videos from one TikTok profile
 - `bulk_urls` — save an explicit list of TikTok video URLs
+- `dramafren` — take one DramaFren detail/watch URL and archive every public listed episode
 - `diagnostic` — verify the Drive queue
 
-For every video Tokisclone can process, it can store the video, normalized metadata, searchable Drive properties, optional subtitles, and optional transcription. Existing Drive video IDs are skipped before download when possible.
+Bulk jobs can partially succeed. Successful items remain archived while failures are reported in the result/manifest.
 
-A profile job can partially succeed. If 99 videos save and one fails, the 99 successes remain saved and the result reports the failed item.
+## Google Drive behavior
 
-## Google Drive structure
+TikTok uses searchable platform/video IDs and skips already stored videos where possible.
+
+DramaFren uses the existing DramaFren library structure and checks for `Episode NNN.mp4` under the title folder before downloading, so re-running the same drama skips episodes already archived.
+
+Typical structure:
 
 ```text
 Tokisclone/
@@ -64,8 +75,13 @@ Tokisclone/
 │       ├── videos/
 │       ├── metadata/
 │       └── transcripts/
-├── Instagram/
-├── YouTube/
+├── Library/
+│   └── DramaFren/
+│       └── Drama Title/
+│           ├── Episode 001.mp4
+│           ├── Episode 002.mp4
+│           └── ...
+├── Manifests/
 └── exports/
 ```
 
@@ -76,8 +92,9 @@ Requirements:
 - Python 3.12+
 - Git
 - FFmpeg
-- your Google account
-- a Google Cloud OAuth Desktop client with Google Drive API access
+- Google account
+- Google Cloud OAuth Desktop client with Google Drive API access
+- Chromium for DramaFren browser-assisted resolution
 
 Clone and create a virtual environment:
 
@@ -105,6 +122,12 @@ Install the personal worker dependencies:
 pip install -r requirements-worker.txt
 ```
 
+Install Chromium once for DramaFren:
+
+```bash
+python -m playwright install chromium
+```
+
 Copy `.env.example` to `.env`, set `GOOGLE_DRIVE_ROOT_FOLDER_ID`, then authorize Google Drive once:
 
 ```bash
@@ -113,15 +136,15 @@ python authorize_drive.py
 
 The generated `token.json` stays local and is excluded from Git.
 
-Start the worker:
+Start the unified worker:
 
 ```bash
 python local_worker.py
 ```
 
-## Job examples
+## Queue examples
 
-### One video
+### One TikTok video
 
 ```json
 {
@@ -132,7 +155,7 @@ python local_worker.py
 }
 ```
 
-### One profile, all public videos
+### One TikTok profile, all public videos
 
 ```json
 {
@@ -146,7 +169,7 @@ python local_worker.py
 
 No `limit` is needed. `bulk_profile` is accepted as an alias for the same behavior.
 
-### Explicit URL batch
+### Explicit TikTok URL batch
 
 ```json
 {
@@ -160,9 +183,61 @@ No `limit` is needed. `bulk_profile` is accepted as an alias for the same behavi
 }
 ```
 
+### One DramaFren URL, all public listed episodes
+
+```json
+{
+  "kind": "dramafren",
+  "platform": "dramafren",
+  "url": "https://dramabox.dramafren.org/index.php?id=42000005228&lang=en&view=detail",
+  "retry_failed_once": true
+}
+```
+
+A DramaFren watch URL works too:
+
+```json
+{
+  "kind": "dramafren",
+  "platform": "dramafren",
+  "url": "https://dramabox.dramafren.org/index.php?ep=12&id=42000005228&lang=en&view=watch"
+}
+```
+
+Tokisclone strips the episode-specific part, resolves the drama ID, discovers the public title page, and processes the complete public listed episode set.
+
 Put the JSON in `Tokisclone/Queue`. The worker moves completed requests and their `.result.json` files to `Done`; fatal job errors go to `Failed`.
 
-## Optional transcription
+## DramaFren browser profile
+
+DramaFren uses a persistent local browser profile by default:
+
+```text
+~/.tokisclone/dramafren-browser
+```
+
+Override it in `.env`:
+
+```text
+DRAMAFREN_BROWSER_PROFILE=/path/to/profile
+```
+
+The persistent profile allows the normal browser session to retain site state. If Cloudflare requests human verification, complete it manually in the opened Chrome window. The worker resumes after the real page appears.
+
+## DramaFren download boundary
+
+The existing DramaFren resolver:
+
+- observes media requests from the normal public page
+- prefers direct MP4
+- supports unencrypted HLS
+- rejects HLS manifests containing `#EXT-X-KEY`
+- does not decrypt protected streams
+- does not bypass CAPTCHA, paywalls, authentication, DRM, or access controls
+
+“One drama URL = all episodes” means all episodes publicly listed by the detail page and successfully exposed to the current normal browser session.
+
+## Optional TikTok transcription
 
 Install:
 
@@ -170,15 +245,7 @@ Install:
 pip install faster-whisper
 ```
 
-Then request:
-
-```json
-{
-  "transcribe": true
-}
-```
-
-The default local model is `small`; change `TOKISCLONE_WHISPER_MODEL` in `.env` if needed.
+Then request `"transcribe": true` on a supported TikTok job. The default local model is `small`; configure `TOKISCLONE_WHISPER_MODEL` in `.env` if needed.
 
 ## Optional TikTok cookies
 
@@ -188,11 +255,22 @@ If TikTok requires your normal logged-in session for content you are authorized 
 TOKISCLONE_COOKIE_FILE=cookies.txt
 ```
 
-Keep that file local. Tokisclone does not implement private-account bypass, CAPTCHA bypass, DRM circumvention, credential theft, or access-control evasion.
+Keep that file local.
 
-## GitHub Actions bridge
+## Other DramaFren execution paths
 
-`process_job.py` and `.github/workflows/process-jobs.yml` support:
+The repository also contains dedicated DramaFren utilities/workflows for diagnostics and packaging, including:
+
+- `dramafren_drive_worker.py`
+- `dramafren_bulk.py`
+- `.github/workflows/dramafren-download.yml`
+- `.github/workflows/package-drama-local-job.yml`
+
+For normal personal use, the unified `local_worker.py` + Google Drive `Queue` is the intended interface.
+
+## GitHub Actions bridge for TikTok
+
+`process_job.py` and `.github/workflows/process-jobs.yml` support TikTok jobs such as:
 
 - `video`
 - `profile`
@@ -201,31 +279,19 @@ Keep that file local. Tokisclone does not implement private-account bypass, CAPT
 - `inspect`
 - `diagnostic`
 
-For GitHub Actions, both `profile` and `bulk_profile` now mean: discover all public videos and download the full discovered set into the temporary workflow artifact.
+Both `profile` and `bulk_profile` mean all public videos discoverable by the extractor.
 
 ## MCP mode
 
-The repository also includes the remote MCP implementation:
-
-- `server.py`
-- `drive_storage.py`
-- `authorize_drive.py`
-- `run_server.py`
-- `Dockerfile`
-
-The MCP `list_profile_videos` and `sync_creator` tools no longer expose a profile limit. `sync_creator(profile_url)` attempts the complete public profile discovered by the extractor and uses the same mandatory clean-only downloader.
+The repository includes the remote MCP implementation for the existing Tokisclone server. The personal Drive-queue mode does not require MCP hosting.
 
 ## Reliability
 
-Tokisclone uses yt-dlp for best-effort public extraction. TikTok can change its web behavior, login requirements, format inventory, or anti-automation behavior. Keep yt-dlp current:
+TikTok, DramaFren, Cloudflare, browser behavior, and extractor behavior can change. Keep dependencies current and expect site-specific maintenance over time.
 
-```bash
-pip install -U yt-dlp
-```
+For TikTok, “all public videos” means all public entries the active extractor/current session can enumerate.
 
-If ordinary profile discovery fails, a `seed_video_url` from the same creator can be supplied to the queue worker/Actions job so Tokisclone can attempt its channel-ID fallback.
-
-"All public videos" means all public entries the active extractor and current session can successfully enumerate. It cannot include private, deleted, region-blocked, or otherwise unavailable videos.
+For DramaFren, “all public listed episodes” means every episode listed on the public drama page that the current normal browser session can resolve as direct video or unencrypted HLS.
 
 ## Security
 
@@ -236,6 +302,7 @@ Never commit:
 - `client_secret.json`
 - `credentials.json`
 - `cookies.txt`
+- browser profile contents
 - private media
 
 Making the repository private is recommended for a personal deployment.
