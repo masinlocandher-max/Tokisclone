@@ -18,17 +18,16 @@ except ImportError:
     pass
 
 from drive_storage import DriveStorage
-from media_core import discover_profile, download_one
+from media_core import (
+    MANDATORY_SOURCE_POLICY,
+    clean_metadata,
+    discover_profile,
+    download_one,
+    ydl,
+)
 
 POLL_SECONDS = max(5, int(os.getenv("TOKISCLONE_POLL_SECONDS", "15")))
 COOKIE_FILE = os.getenv("TOKISCLONE_COOKIE_FILE")
-MAX_PROFILE_VIDEOS = max(
-    1,
-    min(int(os.getenv("TOKISCLONE_MAX_PROFILE_VIDEOS", "500")), 1000),
-)
-DEFAULT_WATERMARK_POLICY = os.getenv(
-    "TOKISCLONE_WATERMARK_POLICY", "prefer-clean"
-).strip().lower()
 
 ALLOWED_TIKTOK_HOSTS = {
     "tiktok.com",
@@ -75,8 +74,7 @@ def _transcribe(media_path: Path) -> dict[str, Any]:
         from faster_whisper import WhisperModel
     except ImportError as exc:
         raise RuntimeError(
-            "Transcription was requested but faster-whisper is not installed. "
-            "Install requirements.txt or pip install faster-whisper."
+            "Transcription was requested but faster-whisper is not installed."
         ) from exc
 
     model_name = os.getenv("TOKISCLONE_WHISPER_MODEL", "small")
@@ -112,13 +110,10 @@ def _save_video(
     *,
     creator_hint: str | None = None,
     transcribe: bool = False,
-    watermark_policy: str = DEFAULT_WATERMARK_POLICY,
     quality: str = "best",
     write_subtitles: bool = False,
 ) -> dict[str, Any]:
     url = _require_tiktok_url(url)
-
-    from media_core import ydl, clean_metadata
 
     with ydl(
         {"noplaylist": True, "skip_download": True},
@@ -139,6 +134,7 @@ def _save_video(
                 "video_id": pre_video_id,
                 "source_url": url,
                 "drive_file": existing,
+                "source_policy": MANDATORY_SOURCE_POLICY,
             }
 
     with tempfile.TemporaryDirectory(prefix="tokisclone-") as td:
@@ -146,7 +142,6 @@ def _save_video(
             url,
             Path(td),
             quality=quality,
-            watermark_policy=watermark_policy,
             write_subtitles=write_subtitles,
             cookie_file=COOKIE_FILE,
         )
@@ -168,6 +163,7 @@ def _save_video(
                 "video_id": video_id,
                 "source_url": url,
                 "drive_file": existing,
+                "source_policy": MANDATORY_SOURCE_POLICY,
             }
 
         creator = _safe(
@@ -189,7 +185,7 @@ def _save_video(
             "video_id": _short_prop(video_id),
             "creator": _short_prop(creator),
             "source_url": _short_prop(metadata.get("url") or url),
-            "watermark_policy": _short_prop(watermark_policy),
+            "source_policy": MANDATORY_SOURCE_POLICY,
         }
 
         mime_type = mimetypes.guess_type(media_path.name)[0] or "video/mp4"
@@ -204,7 +200,7 @@ def _save_video(
             {
                 **metadata,
                 "tokisclone": {
-                    "watermark_policy": watermark_policy,
+                    "source_policy": MANDATORY_SOURCE_POLICY,
                     "format_selector": result.get("format_selector"),
                 },
             },
@@ -231,7 +227,7 @@ def _save_video(
             "video_id": video_id,
             "creator": creator,
             "source_url": metadata.get("url") or url,
-            "watermark_policy": watermark_policy,
+            "source_policy": MANDATORY_SOURCE_POLICY,
             "drive_video": drive_video,
             "drive_metadata": drive_metadata,
             "drive_transcript": transcript_file,
@@ -244,7 +240,6 @@ def _save_with_retry(
     *,
     creator_hint: str | None,
     transcribe: bool,
-    watermark_policy: str,
     quality: str,
     write_subtitles: bool,
     retry_failed_once: bool,
@@ -255,7 +250,6 @@ def _save_with_retry(
             url,
             creator_hint=creator_hint,
             transcribe=transcribe,
-            watermark_policy=watermark_policy,
             quality=quality,
             write_subtitles=write_subtitles,
         )
@@ -268,7 +262,6 @@ def _save_with_retry(
                 url,
                 creator_hint=creator_hint,
                 transcribe=transcribe,
-                watermark_policy=watermark_policy,
                 quality=quality,
                 write_subtitles=write_subtitles,
             )
@@ -286,14 +279,12 @@ def _process_video_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, 
     return {
         "kind": "video",
         "ok": True,
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "result": _save_with_retry(
             storage,
             url,
             creator_hint=job.get("creator"),
             transcribe=bool(job.get("transcribe", False)),
-            watermark_policy=str(
-                job.get("watermark_policy") or DEFAULT_WATERMARK_POLICY
-            ),
             quality=str(job.get("quality") or "best"),
             write_subtitles=bool(job.get("write_subtitles", False)),
             retry_failed_once=bool(job.get("retry_failed_once", True)),
@@ -303,12 +294,10 @@ def _process_video_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, 
 
 def _profile_inventory(
     profile_url: str,
-    limit: int,
     seed_video_url: str | None,
 ) -> dict[str, Any]:
     return discover_profile(
         profile_url,
-        limit,
         seed_video_url=seed_video_url,
         cookie_file=COOKIE_FILE,
     )
@@ -316,24 +305,15 @@ def _profile_inventory(
 
 def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
     profile_url = _require_tiktok_url(str(job.get("profile_url") or ""))
-    requested_limit = int(job.get("limit", job.get("max_items", 100)))
-    limit = max(1, min(requested_limit, MAX_PROFILE_VIDEOS))
-    download_new_only = bool(job.get("download_new_only", True))
     transcribe = bool(job.get("transcribe", False))
     creator_hint = _profile_username(profile_url)
     seed_video_url = str(job.get("seed_video_url") or "").strip() or None
-    watermark_policy = str(
-        job.get("watermark_policy") or DEFAULT_WATERMARK_POLICY
-    )
     quality = str(job.get("quality") or "best")
     write_subtitles = bool(job.get("write_subtitles", False))
     retry_failed_once = bool(job.get("retry_failed_once", True))
 
-    inventory_result = _profile_inventory(
-        profile_url,
-        limit,
-        seed_video_url,
-    )
+    # No profile limit is read here. One profile means all public videos.
+    inventory_result = _profile_inventory(profile_url, seed_video_url)
     inventory = inventory_result["videos"]
 
     already_saved = 0
@@ -345,6 +325,7 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
     for item in inventory:
         video_id = str(item.get("id") or "")
         item_url = str(item.get("url") or "")
+
         if not item_url:
             failed += 1
             details.append(
@@ -356,7 +337,7 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
             )
             continue
 
-        if download_new_only and video_id:
+        if video_id:
             existing = storage.find_video("tiktok", video_id)
             if existing:
                 already_saved += 1
@@ -376,7 +357,6 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
                 item_url,
                 creator_hint=creator_hint,
                 transcribe=transcribe,
-                watermark_policy=watermark_policy,
                 quality=quality,
                 write_subtitles=write_subtitles,
                 retry_failed_once=retry_failed_once,
@@ -399,9 +379,7 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
                 }
             )
 
-    metadata_folder = storage.creator_subfolder(
-        "tiktok", creator_hint, "metadata"
-    )
+    metadata_folder = storage.creator_subfolder("tiktok", creator_hint, "metadata")
     inventory_file = storage.upload_json(
         inventory_result,
         parent_id=metadata_folder["id"],
@@ -410,26 +388,41 @@ def _process_profile_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str
             "kind": "profile_inventory",
             "platform": "tiktok",
             "creator": _short_prop(creator_hint),
+            "scope": "all_public",
         },
     )
+
+    manifest_payload = {
+        "profile_url": profile_url,
+        "scope": "all_public",
+        "source_policy": MANDATORY_SOURCE_POLICY,
+        "found": len(inventory),
+        "saved": saved,
+        "already_saved": already_saved,
+        "failed": failed,
+        "retried": retried,
+        "items": details,
+    }
     manifest_file = storage.upload_json(
-        details,
+        manifest_payload,
         parent_id=metadata_folder["id"],
         name="latest-bulk-manifest.json",
         properties={
             "kind": "bulk_manifest",
             "platform": "tiktok",
             "creator": _short_prop(creator_hint),
+            "scope": "all_public",
         },
     )
 
     return {
-        "kind": str(job.get("kind") or "profile"),
+        "kind": "profile",
         "ok": True,
         "complete": failed == 0,
         "status": "completed" if failed == 0 else "completed_with_errors",
         "profile_url": profile_url,
-        "watermark_policy": watermark_policy,
+        "scope": "all_public",
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "quality": quality,
         "discovery_method": inventory_result["discovery_method"],
         "found": len(inventory),
@@ -451,17 +444,10 @@ def _process_bulk_urls_job(
     if not isinstance(raw_urls, list):
         raise ValueError("bulk_urls requires a urls array")
 
-    watermark_policy = str(
-        job.get("watermark_policy") or DEFAULT_WATERMARK_POLICY
-    )
     quality = str(job.get("quality") or "best")
     transcribe = bool(job.get("transcribe", False))
     write_subtitles = bool(job.get("write_subtitles", False))
     retry_failed_once = bool(job.get("retry_failed_once", True))
-    max_items = max(
-        1,
-        min(int(job.get("max_items", len(raw_urls) or 1)), 1000),
-    )
 
     seen: set[str] = set()
     urls: list[str] = []
@@ -471,8 +457,6 @@ def _process_bulk_urls_job(
             continue
         seen.add(value)
         urls.append(value)
-        if len(urls) >= max_items:
-            break
 
     saved = 0
     already_saved = 0
@@ -487,7 +471,6 @@ def _process_bulk_urls_job(
                 url,
                 creator_hint=None,
                 transcribe=transcribe,
-                watermark_policy=watermark_policy,
                 quality=quality,
                 write_subtitles=write_subtitles,
                 retry_failed_once=retry_failed_once,
@@ -511,7 +494,15 @@ def _process_bulk_urls_job(
 
     exports = storage.ensure_folder("exports")
     manifest = storage.upload_json(
-        details,
+        {
+            "source_policy": MANDATORY_SOURCE_POLICY,
+            "requested": len(urls),
+            "saved": saved,
+            "already_saved": already_saved,
+            "failed": failed,
+            "retried": retried,
+            "items": details,
+        },
         parent_id=exports["id"],
         name=f"bulk-urls-{int(time.time())}.json",
         properties={"kind": "bulk_manifest", "platform": "tiktok"},
@@ -527,7 +518,7 @@ def _process_bulk_urls_job(
         "already_saved": already_saved,
         "failed": failed,
         "retried": retried,
-        "watermark_policy": watermark_policy,
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "quality": quality,
         "manifest_file": manifest,
         "items": details,
@@ -552,6 +543,7 @@ def process_job(storage: DriveStorage, job: dict[str, Any]) -> dict[str, Any]:
             "kind": "diagnostic",
             "ok": True,
             "message": job.get("message", "Tokisclone OK"),
+            "source_policy": MANDATORY_SOURCE_POLICY,
         }
 
     raise ValueError(
@@ -590,6 +582,7 @@ def process_queue_once(storage: DriveStorage) -> int:
                 "ok": False,
                 "job_file": job_name,
                 "error": f"{type(exc).__name__}: {exc}",
+                "source_policy": MANDATORY_SOURCE_POLICY,
             }
 
         result_name = f"{Path(job_name).stem}.result.json"
@@ -607,12 +600,7 @@ def process_queue_once(storage: DriveStorage) -> int:
             from_parent=queue["id"],
             to_parent=result_parent,
         )
-        print(
-            json.dumps(
-                {"job": job_name, "result": result},
-                ensure_ascii=False,
-            )
-        )
+        print(json.dumps({"job": job_name, "result": result}, ensure_ascii=False))
 
     return processed
 
@@ -631,6 +619,10 @@ def main() -> None:
     print(
         f"Watching Queue every {POLL_SECONDS} seconds. "
         "Press Ctrl+C to stop."
+    )
+    print(
+        "Source policy: clean-only (mandatory). "
+        "Profile scope: all public videos."
     )
 
     while not _STOP:

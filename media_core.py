@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 import yt_dlp
 
-VALID_WATERMARK_POLICIES = {"prefer-clean", "clean-only", "allow"}
+MANDATORY_SOURCE_POLICY = "clean-only"
 VALID_QUALITIES = {"best", "1080p", "720p"}
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".m4v",
@@ -42,16 +42,6 @@ def clean_metadata(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_watermark_policy(value: str | None) -> str:
-    policy = (value or "prefer-clean").strip().lower()
-    if policy not in VALID_WATERMARK_POLICIES:
-        raise ValueError(
-            "watermark_policy must be one of: "
-            + ", ".join(sorted(VALID_WATERMARK_POLICIES))
-        )
-    return policy
-
-
 def validate_quality(value: str | None) -> str:
     quality = (value or "best").strip().lower()
     if quality not in VALID_QUALITIES:
@@ -64,17 +54,15 @@ def validate_quality(value: str | None) -> str:
 
 def video_format_selector(
     quality: str = "best",
-    watermark_policy: str = "prefer-clean",
+    watermark_policy: str | None = None,
 ) -> str:
-    """
-    Prefer source formats not identified as TikTok's marked `download` rendition.
+    """Return Tokisclone's mandatory strict clean-only selector.
 
-    This does not erase or alter watermarks after download. If a platform exposes
-    only a marked rendition, `clean-only` intentionally does not add a generic
-    fallback. `prefer-clean` keeps a generic fallback for compatibility.
+    ``watermark_policy`` remains only so older queued jobs do not crash. It is
+    deliberately ignored and cannot relax the clean-only rule.
     """
+    _ = watermark_policy
     quality = validate_quality(quality)
-    policy = validate_watermark_policy(watermark_policy)
 
     height = ""
     if quality == "1080p":
@@ -82,17 +70,10 @@ def video_format_selector(
     elif quality == "720p":
         height = "[height<=720]"
 
-    clean = (
+    return (
         f"bv*{height}[format_id!=download]+ba/"
         f"b{height}[format_id!=download]"
     )
-    generic = f"bv*{height}+ba/b{height}/b"
-
-    if policy == "clean-only":
-        return clean
-    if policy == "prefer-clean":
-        return f"{clean}/{generic}"
-    return generic
 
 
 def ydl(
@@ -181,14 +162,14 @@ def _normalize_profile_entries(
 
 def _extract_profile(
     source: str,
-    limit: int,
     *,
     cookie_file: str | None = None,
 ) -> dict[str, Any]:
+    # No playlistend on purpose. One profile means every public entry the
+    # current extractor/session can enumerate.
     with ydl(
         {
             "extract_flat": True,
-            "playlistend": limit,
             "skip_download": True,
         },
         cookie_file=cookie_file,
@@ -221,19 +202,19 @@ def _channel_id_from_video(
 
 def discover_profile(
     profile_url: str,
-    limit: int = 100,
+    limit: int | None = None,
     *,
     seed_video_url: str | None = None,
     cookie_file: str | None = None,
 ) -> dict[str, Any]:
-    limit = max(1, min(int(limit), 1000))
+    # ``limit`` is legacy compatibility only and is intentionally ignored.
+    _ = limit
     primary_error: str | None = None
     discovery_method = "profile_url"
 
     try:
         info = _extract_profile(
             profile_url,
-            limit,
             cookie_file=cookie_file,
         )
         videos = _normalize_profile_entries(info, profile_url)
@@ -252,13 +233,14 @@ def discover_profile(
                 discovery_method = "seed_video_channel_id"
                 info = _extract_profile(
                     f"tiktokuser:{channel_id}",
-                    limit,
                     cookie_file=cookie_file,
                 )
                 videos = _normalize_profile_entries(info, profile_url)
         except Exception as exc:
             if primary_error:
-                primary_error += f"; seed fallback: {type(exc).__name__}: {exc}"
+                primary_error += (
+                    f"; seed fallback: {type(exc).__name__}: {exc}"
+                )
             else:
                 primary_error = f"{type(exc).__name__}: {exc}"
 
@@ -270,6 +252,7 @@ def discover_profile(
 
     return {
         "profile_url": profile_url,
+        "scope": "all_public",
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
         "count": len(videos),
@@ -316,7 +299,28 @@ def inspect_video_formats(
             }
         )
 
-    return {"video": clean_metadata(info), "formats": formats}
+    return {
+        "video": clean_metadata(info),
+        "formats": formats,
+        "source_policy": MANDATORY_SOURCE_POLICY,
+    }
+
+
+def _format_is_marked(info: dict[str, Any]) -> bool:
+    candidates: list[dict[str, Any]] = [info]
+    requested = info.get("requested_formats")
+    if isinstance(requested, list):
+        candidates.extend(
+            item for item in requested if isinstance(item, dict)
+        )
+
+    for item in candidates:
+        fmt_id = str(item.get("format_id") or "").lower()
+        fmt_note = str(item.get("format_note") or "").lower()
+        if fmt_id == "download" or "watermark" in fmt_note:
+            return True
+
+    return False
 
 
 def _media_candidates(folder: Path, video_id: str | None) -> list[Path]:
@@ -334,21 +338,67 @@ def _media_candidates(folder: Path, video_id: str | None) -> list[Path]:
     return candidates
 
 
+def _purge_output(folder: Path, video_id: str | None) -> None:
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+        if video_id and video_id not in path.name:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _remove_archive_entry(
+    archive_path: str | Path | None,
+    video_id: str | None,
+) -> None:
+    if not archive_path or not video_id:
+        return
+
+    path = Path(archive_path)
+    if not path.exists():
+        return
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        kept = [
+            line
+            for line in lines
+            if not (
+                line.strip() == video_id
+                or line.strip().endswith(f" {video_id}")
+            )
+        ]
+        path.write_text(
+            "\n".join(kept) + ("\n" if kept else ""),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def download_one(
     url: str,
     output_dir: str | Path,
     *,
     quality: str = "best",
-    watermark_policy: str = "prefer-clean",
+    watermark_policy: str | None = None,
     write_subtitles: bool = False,
     cookie_file: str | None = None,
     archive_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    # ``watermark_policy`` is accepted only so old queued jobs remain readable.
+    # It cannot change the mandatory clean-only selector.
+    _ = watermark_policy
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    format_selector = video_format_selector(quality, watermark_policy)
-    outtmpl = str(output_dir / "%(uploader_id,uploader|unknown)s_%(id)s.%(ext)s")
+    format_selector = video_format_selector(quality)
+    outtmpl = str(
+        output_dir / "%(uploader_id,uploader|unknown)s_%(id)s.%(ext)s"
+    )
 
     options: dict[str, Any] = {
         "noplaylist": True,
@@ -372,15 +422,23 @@ def download_one(
 
     metadata = clean_metadata(info)
     video_id = str(metadata.get("id") or "") or None
-    media = _media_candidates(output_dir, video_id)
 
+    if _format_is_marked(info):
+        _purge_output(output_dir, video_id)
+        _remove_archive_entry(archive_path, video_id)
+        raise RuntimeError(
+            "Source was identified as watermarked; "
+            "Tokisclone clean-only policy rejected it."
+        )
+
+    media = _media_candidates(output_dir, video_id)
     status = "downloaded" if media else "already_archived_or_no_media"
 
     return {
         "status": status,
         "url": url,
         "video_id": video_id,
-        "watermark_policy": validate_watermark_policy(watermark_policy),
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "format_selector": format_selector,
         "metadata": metadata,
         "media_files": [str(p.resolve()) for p in media],
@@ -392,12 +450,17 @@ def bulk_download(
     output_dir: str | Path,
     *,
     quality: str = "best",
-    watermark_policy: str = "prefer-clean",
+    watermark_policy: str | None = None,
     write_subtitles: bool = False,
     cookie_file: str | None = None,
     retry_failed_once: bool = True,
-    max_items: int = 1000,
+    max_items: int | None = None,
 ) -> dict[str, Any]:
+    # Legacy controls are ignored: clean-only is mandatory and the supplied
+    # URL list is processed in full.
+    _ = watermark_policy
+    _ = max_items
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -411,8 +474,6 @@ def bulk_download(
             continue
         seen.add(value)
         clean_urls.append(value)
-        if len(clean_urls) >= max(1, min(int(max_items), 1000)):
-            break
 
     if not clean_urls:
         raise ValueError("No valid http(s) video URLs were supplied")
@@ -422,14 +483,13 @@ def bulk_download(
     failures: list[dict[str, Any]] = []
 
     for index, url in enumerate(clean_urls, start=1):
-        item_dir = output_dir / "items" / f"{index:04d}"
+        item_dir = output_dir / "items" / f"{index:06d}"
         try:
             results.append(
                 download_one(
                     url,
                     item_dir,
                     quality=quality,
-                    watermark_policy=watermark_policy,
                     write_subtitles=write_subtitles,
                     cookie_file=cookie_file,
                     archive_path=archive_path,
@@ -447,15 +507,15 @@ def bulk_download(
     if failures and retry_failed_once:
         retry_queue = list(failures)
         failures = []
+
         for retry_index, item in enumerate(retry_queue, start=1):
             url = item["url"]
-            item_dir = output_dir / "retries" / f"{retry_index:04d}"
+            item_dir = output_dir / "retries" / f"{retry_index:06d}"
             try:
                 result = download_one(
                     url,
                     item_dir,
                     quality=quality,
-                    watermark_policy=watermark_policy,
                     write_subtitles=write_subtitles,
                     cookie_file=cookie_file,
                     archive_path=archive_path,
@@ -475,7 +535,7 @@ def bulk_download(
         "requested": len(clean_urls),
         "succeeded": len(results),
         "failed": len(failures),
-        "watermark_policy": validate_watermark_policy(watermark_policy),
+        "source_policy": MANDATORY_SOURCE_POLICY,
         "quality": validate_quality(quality),
         "archive": str(archive_path.resolve()),
         "items": results,
