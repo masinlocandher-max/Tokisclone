@@ -1,6 +1,6 @@
 # Personal ChatGPT Mode
 
-This is the recommended Tokisclone setup while it is a single-owner personal tool.
+This is the recommended Tokisclone architecture while the tool has one owner.
 
 ## Architecture
 
@@ -9,51 +9,84 @@ You
  ↓
 ChatGPT
  ↓
-GitHub connector
+Google Drive / Tokisclone / Queue
  ↓
-Tokisclone GitHub Action worker
+Tokisclone local worker on your computer
  ↓
-GitHub Actions artifact
+TikTok through your normal internet connection
  ↓
-ChatGPT working runtime
- ↓
-Google Drive connector
- ↓
-Tokisclone/TikTok, Instagram, YouTube
+Google Drive archive
 ```
 
-No always-on server is required for this mode. No Google Drive OAuth token needs to be stored in GitHub.
+ChatGPT is the interface. Google Drive is both the lightweight job queue and the permanent media library. Your computer supplies the TikTok-facing network connection and temporary processing compute.
 
-## How it works
+No dashboard, database, public MCP server, GitHub-hosted media worker, or TokScript subscription is required for the personal version.
 
-1. You give ChatGPT a public video or creator URL and ask it to process/save the content.
-2. ChatGPT creates a job JSON file under `jobs/` in this repository.
-3. `.github/workflows/process-jobs.yml` runs on GitHub Actions.
-4. `process_job.py` uses yt-dlp and ffmpeg to produce the requested result.
-5. GitHub stores the result briefly as a workflow artifact.
-6. ChatGPT retrieves and extracts the artifact.
-7. ChatGPT uploads the resulting media file into the connected Google Drive folder.
-8. Temporary runtime files and short-lived GitHub artifacts are not the permanent library. Google Drive is the permanent destination.
+## Why this is now the default
 
-## Supported personal jobs
+We tested several GitHub-hosted approaches against a real public TikTok profile:
 
-### One video
+- yt-dlp profile discovery
+- yt-dlp with browser TLS impersonation
+- TikTok public profile hydration
+- TikTok's guest post-list request
+- a real headless Chrome session
+
+The public profile itself loaded, but TikTok's video-list request returned `403` from GitHub's datacenter network. That makes GitHub-hosted Actions a poor default for TikTok extraction even when the code is otherwise correct.
+
+Running the media worker on the owner's normal network removes that datacenter-origin problem while keeping the workflow simple.
+
+## Drive folders
+
+The current Tokisclone root contains:
+
+```text
+Tokisclone/
+├── Queue/
+├── Done/
+├── Failed/
+├── TikTok/
+├── Instagram/
+├── YouTube/
+└── exports/
+```
+
+The local worker creates creator-specific `videos`, `metadata`, and `transcripts` folders when needed.
+
+## How a request works
+
+1. You tell ChatGPT what to save or sync.
+2. ChatGPT creates a small JSON instruction and uploads it to `Tokisclone/Queue` in the connected Google Drive.
+3. `local_worker.py`, running on your computer, reads the queued instruction.
+4. The worker discovers/downloads the public TikTok content over your normal internet connection.
+5. It checks Drive for duplicate video IDs.
+6. New media, metadata, and optional transcripts are saved directly into Google Drive.
+7. The worker writes a result JSON and moves the request to `Done` or `Failed`.
+8. ChatGPT can inspect those folders and report the result to you.
+
+## Supported local jobs
+
+### Save one video
 
 ```json
 {
   "kind": "video",
-  "url": "https://...",
-  "write_subtitles": false
+  "platform": "tiktok",
+  "url": "https://www.tiktok.com/@creator/video/1234567890",
+  "transcribe": false
 }
 ```
 
-### Creator/profile inventory
+### Sync a public creator
 
 ```json
 {
   "kind": "profile",
-  "profile_url": "https://...",
-  "limit": 100
+  "platform": "tiktok",
+  "profile_url": "https://www.tiktok.com/@creator",
+  "limit": 100,
+  "download_new_only": true,
+  "transcribe": false
 }
 ```
 
@@ -62,34 +95,49 @@ No always-on server is required for this mode. No Google Drive OAuth token needs
 ```json
 {
   "kind": "diagnostic",
-  "message": "Tokisclone bridge OK"
+  "platform": "tiktok",
+  "message": "Tokisclone OK"
 }
 ```
 
-## Google Drive structure
+## Local setup
 
-The current personal library root is `Tokisclone`, with platform folders for TikTok, Instagram, YouTube, plus `exports`.
+See [`LOCAL_WORKER_SETUP.md`](LOCAL_WORKER_SETUP.md).
 
-Creator-specific subfolders can be created as the library grows.
+The one-time local requirements are:
 
-## Why this is the default personal mode
+- Python 3.12+
+- this repository cloned locally
+- a Google OAuth Desktop client for your own Drive account
+- `client_secret.json` kept locally
+- `python authorize_drive.py` once
+- `python run_local_worker.py` whenever you want the queue processed
 
-It avoids:
+The ChatGPT Google Drive connection and the local program's Google authorization are separate. The local worker cannot borrow ChatGPT's private Drive token.
 
-- a TokScript subscription
-- an always-on MCP hosting bill
-- storing a Google Drive refresh token in GitHub
-- building a separate dashboard
-- maintaining a database before it is needed
+## Optional direct MCP mode
 
-GitHub Actions supplies temporary compute only when a job is submitted. ChatGPT remains the conversational interface and Google Drive remains the archive.
+The repository still contains the MCP server implementation for a future always-on deployment. That is not needed for the personal version.
 
-## Direct MCP mode
+## GitHub Actions
 
-The repository still contains `server.py`, `drive_storage.py`, `authorize_drive.py`, and Docker support for a future always-on MCP deployment. That mode is optional and is not required for the current personal ChatGPT workflow.
+The GitHub-hosted media workflows remain useful as diagnostics and for services that do not reject datacenter traffic. They should not be treated as the primary TikTok backend.
 
-## Security and rights
+## Security
 
-This workflow is for public content that the owner is permitted to download, archive, transcribe, or otherwise process. It does not include private-account access, CAPTCHA bypassing, DRM circumvention, credential theft, or anti-bot evasion.
+Make the repository private before treating it as a personal operational project.
 
-The repository should be made private before using it for real job URLs or other personal workflow data.
+Never commit or upload:
+
+- `token.json`
+- `client_secret.json`
+- `.env`
+- `cookies.txt`
+- private media
+- access credentials
+
+The local worker does not require an inbound port and should not be exposed publicly.
+
+## Access boundary
+
+Tokisclone is for public content the owner is authorized to archive or use. It does not implement CAPTCHA bypassing, private-account access, DRM circumvention, credential theft, or other access-control bypasses.
