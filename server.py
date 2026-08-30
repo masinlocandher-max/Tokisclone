@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yt_dlp
-from mcp.server import MCPServer
+from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("FMB Video MCP")
 
