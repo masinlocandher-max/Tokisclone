@@ -4,11 +4,14 @@ import argparse
 import json
 import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 import yt_dlp
+
+TIKDATA_BASE = "https://api.tik-data.com"
 
 
 def _safe(value: str, fallback: str = "item") -> str:
@@ -47,6 +50,42 @@ def _ydl(extra: dict[str, Any] | None = None) -> yt_dlp.YoutubeDL:
     return yt_dlp.YoutubeDL(opts)
 
 
+def _public_api_get(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    if not path.startswith("/api/v1/public/"):
+        raise ValueError("Only fixed public retrieval API paths are allowed")
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    url = f"{TIKDATA_BASE}{path}?{query}" if query else f"{TIKDATA_BASE}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Tokisclone/1.0 (+personal research tool)",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        raw = response.read()
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("Public API returned a non-object JSON response")
+    return data
+
+
+def _largest_list(value: Any) -> list[Any]:
+    best: list[Any] = []
+    if isinstance(value, list):
+        best = value
+        for item in value:
+            candidate = _largest_list(item)
+            if len(candidate) > len(best):
+                best = candidate
+    elif isinstance(value, dict):
+        for item in value.values():
+            candidate = _largest_list(item)
+            if len(candidate) > len(best):
+                best = candidate
+    return best
+
+
 def diagnostic(job: dict[str, Any], out: Path) -> dict[str, Any]:
     text = str(job.get("message") or "Tokisclone bridge OK")
     path = out / "diagnostic.txt"
@@ -56,7 +95,7 @@ def diagnostic(job: dict[str, Any], out: Path) -> dict[str, Any]:
 
 def tikdata_probe(job: dict[str, Any], out: Path) -> dict[str, Any]:
     """Fetch the advertised OpenAPI schema from the fixed public TikTok API host."""
-    url = "https://api.tik-data.com/api/openapi.json"
+    url = f"{TIKDATA_BASE}/api/openapi.json"
     req = urllib.request.Request(
         url,
         headers={
@@ -83,6 +122,36 @@ def tikdata_probe(job: dict[str, Any], out: Path) -> dict[str, Any]:
         "version": (spec.get("info") or {}).get("version"),
         "paths": paths,
         "file": path.name,
+    }
+
+
+def tikdata_profile_probe(job: dict[str, Any], out: Path) -> dict[str, Any]:
+    username = str(job.get("username") or "").strip().lstrip("@")
+    if not username or not re.fullmatch(r"[A-Za-z0-9._]+", username):
+        raise ValueError("username must be a TikTok username")
+
+    check = _public_api_get("/api/v1/public/check", {"username": username})
+    posts = _public_api_get(
+        "/api/v1/public/posts",
+        {"username": username, "count": 30, "cursor": 0},
+    )
+
+    (out / "profile-check.json").write_text(
+        json.dumps(check, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out / "profile-posts.json").write_text(
+        json.dumps(posts, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    candidates = _largest_list(posts)
+    return {
+        "kind": "tikdata_profile_probe",
+        "ok": True,
+        "username": username,
+        "check_keys": sorted(check.keys()),
+        "posts_keys": sorted(posts.keys()),
+        "largest_list_count": len(candidates),
+        "files": ["profile-check.json", "profile-posts.json"],
     }
 
 
@@ -223,20 +292,36 @@ def profile_inventory(job: dict[str, Any], out: Path) -> dict[str, Any]:
         videos = []
 
     if not videos and seed_video_url:
-        channel_id = _channel_id_from_video(seed_video_url)
-        if not channel_id:
-            raise RuntimeError(
-                "Profile discovery failed and the seed video did not expose a TikTok channel_id. "
-                f"Primary error: {primary_error or 'empty profile result'}"
-            )
-        discovery_method = "seed_video_channel_id"
-        info = _extract_profile(f"tiktokuser:{channel_id}", limit)
-        videos = _normalize_profile_entries(info, profile_url)
+        try:
+            channel_id = _channel_id_from_video(seed_video_url)
+            if channel_id:
+                discovery_method = "seed_video_channel_id"
+                info = _extract_profile(f"tiktokuser:{channel_id}", limit)
+                videos = _normalize_profile_entries(info, profile_url)
+        except Exception:
+            pass
 
-    if not videos and primary_error:
+    if not videos and "tiktok.com" in profile_url.lower():
+        username = profile_url.rstrip("/").split("/")[-1].lstrip("@")
+        try:
+            posts = _public_api_get(
+                "/api/v1/public/posts",
+                {"username": username, "count": min(limit, 30), "cursor": 0},
+            )
+            raw_items = _largest_list(posts)
+            videos = [item for item in raw_items if isinstance(item, dict)]
+            if videos:
+                discovery_method = "public_api_fallback"
+                (out / "public-api-raw.json").write_text(
+                    json.dumps(posts, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        except Exception:
+            videos = []
+
+    if not videos:
         raise RuntimeError(
-            "TikTok profile discovery failed. Provide seed_video_url from the same creator so "
-            f"Tokisclone can resolve the secondary channel ID. Primary error: {primary_error}"
+            "TikTok profile discovery failed through direct extraction and the public API fallback. "
+            f"Primary error: {primary_error or 'empty profile result'}"
         )
 
     inventory_path = out / "inventory.json"
@@ -272,6 +357,8 @@ def main() -> int:
             result = diagnostic(job, out)
         elif kind == "tikdata_probe":
             result = tikdata_probe(job, out)
+        elif kind == "tikdata_profile_probe":
+            result = tikdata_profile_probe(job, out)
         elif kind == "inspect":
             result = inspect_url(job, out)
         elif kind == "video":
