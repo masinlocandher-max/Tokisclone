@@ -11,6 +11,9 @@ from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 
+from dramafren_adapter import discover_drama, inspect_episode
+from dramafren_drive import SOURCE_POLICY as DRAMAFREN_SOURCE_POLICY
+from dramafren_drive import archive_drama_to_drive
 from drive_storage import DriveStorage
 from media_core import (
     MANDATORY_SOURCE_POLICY,
@@ -27,6 +30,8 @@ COOKIE_FILE = os.getenv("TOKISCLONE_COOKIE_FILE")
 
 def _platform(url: str, extractor: str | None = None) -> str:
     haystack = f"{url} {extractor or ''}".lower()
+    if "dramafren" in haystack:
+        return "dramafren"
     if "tiktok" in haystack:
         return "tiktok"
     if "instagram" in haystack:
@@ -294,6 +299,39 @@ def sync_creator(
 
 
 @mcp.tool()
+def inspect_dramafren_drama(url: str) -> dict[str, Any]:
+    """Discover the complete public episode list for one DramaFren title/watch URL."""
+    result = discover_drama(url, cookie_file=COOKIE_FILE)
+    return {
+        **result,
+        "scope": "all_public_episodes",
+        "source_policy": DRAMAFREN_SOURCE_POLICY,
+    }
+
+
+@mcp.tool()
+def inspect_dramafren_episode(url: str) -> dict[str, Any]:
+    """Inspect one public DramaFren episode and reject apparent DRM-protected media."""
+    return {
+        **inspect_episode(url, cookie_file=COOKIE_FILE),
+        "source_policy": DRAMAFREN_SOURCE_POLICY,
+    }
+
+
+@mcp.tool()
+def archive_dramafren_to_drive(
+    url: str,
+    retry_failed_once: bool = True,
+) -> dict[str, Any]:
+    """Archive all public episodes exposed for one DramaFren title to Google Drive."""
+    return archive_drama_to_drive(
+        DriveStorage(),
+        url,
+        retry_failed_once=retry_failed_once,
+    )
+
+
+@mcp.tool()
 def list_drive_library(
     platform: str | None = None,
     creator: str | None = None,
@@ -433,11 +471,16 @@ def health() -> dict[str, Any]:
         "storage": "Google Drive",
         "source_policy": MANDATORY_SOURCE_POLICY,
         "profile_scope": "all_public",
+        "dramafren_source_policy": DRAMAFREN_SOURCE_POLICY,
+        "dramafren_scope": "all_public_episodes",
         "tools": [
             "inspect_video",
             "list_profile_videos",
             "save_video_to_drive",
             "sync_creator",
+            "inspect_dramafren_drama",
+            "inspect_dramafren_episode",
+            "archive_dramafren_to_drive",
             "list_drive_library",
             "get_saved_video",
             "transcribe_video",
