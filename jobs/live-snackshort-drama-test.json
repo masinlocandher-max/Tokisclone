@@ -1,0 +1,9 @@
+{
+  "kind": "bulk_profile",
+  "platform": "tiktok",
+  "profile_url": "https://www.tiktok.com/@snackshort_drama",
+  "seed_video_url": "https://vt.tiktok.com/ZSV78quKg/",
+  "quality": "best",
+  "retry_failed_once": true,
+  "transcribe": false
+}
