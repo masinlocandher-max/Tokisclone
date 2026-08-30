@@ -67,7 +67,12 @@ jobs:
           while IFS= read -r job; do
             name="$(basename "$job" .json)"
             mkdir -p "output/$name"
-            if ! python dramafren_browser.py "$job" --output "output/$name"; then
+            runner="dramafren_browser.py"
+            if grep -Eq '"detail_url"[[:space:]]*:[[:space:]]*"https://dramafren\.org/' "$job"; then
+              runner="dramafren_main_probe.py"
+            fi
+            echo "Using $runner for $job"
+            if ! python "$runner" "$job" --output "output/$name"; then
               overall=1
             fi
           done < /tmp/drama-jobs.txt
