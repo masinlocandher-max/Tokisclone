@@ -1,0 +1,104 @@
+name: DramaFren Access Probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "drama-probe-jobs/**/*.json"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: pip install "playwright>=1.55,<2"
+      - name: Locate browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            python -m playwright install --with-deps chromium
+          else
+            echo "CHROME_BIN=$CHROME_BIN" >> "$GITHUB_ENV"
+          fi
+      - name: Find probe job
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^drama-probe-jobs/.+\.json$' | head -1 > /tmp/jobpath
+          test -s /tmp/jobpath
+      - name: Probe public page only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import asyncio, json, os, re, urllib.parse
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          job_path = Path(open('/tmp/jobpath').read().strip())
+          job = json.loads(job_path.read_text())
+          url = job['detail_url']
+          out = Path('output/result.json')
+
+          def redact(value):
+              p = urllib.parse.urlparse(value)
+              keys = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+              q = urllib.parse.urlencode([(k, 'REDACTED') for k, _ in keys])
+              return urllib.parse.urlunparse((p.scheme,p.netloc,p.path,p.params,q,''))
+
+          async def main():
+              async with async_playwright() as p:
+                  kwargs = {'headless': True, 'args':['--no-sandbox','--disable-dev-shm-usage']}
+                  if os.getenv('CHROME_BIN'):
+                      kwargs['executable_path'] = os.environ['CHROME_BIN']
+                  browser = await p.chromium.launch(**kwargs)
+                  page = await browser.new_page(viewport={'width':1365,'height':900})
+                  candidates = []
+                  def capture(resp):
+                      try:
+                          u = resp.url.lower(); ct = (resp.headers.get('content-type') or '').lower()
+                          if '.mp4' in u or '.m3u8' in u or ct.startswith('video/') or 'mpegurl' in ct:
+                              candidates.append({'status':resp.status,'url':redact(resp.url),'content_type':ct})
+                      except Exception:
+                          pass
+                  page.on('response', capture)
+                  result = {'ok':False,'detail_url':redact(url),'candidate_count':0}
+                  try:
+                      response = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                      title = await page.title()
+                      body = ''
+                      try:
+                          body = (await page.locator('body').inner_text(timeout=3000))[:1500]
+                      except Exception:
+                          pass
+                      challenge = ('just a moment' in title.lower() or 'verify you are human' in body.lower())
+                      await page.wait_for_timeout(8000)
+                      result.update({'ok':True,'http_status':response.status if response else None,'title':title,'challenge':challenge,'candidate_count':len(candidates),'candidates':candidates[:20]})
+                  except Exception as exc:
+                      result.update({'error':f'{type(exc).__name__}: {exc}'})
+                  finally:
+                      await browser.close()
+                  out.write_text(json.dumps(result, indent=2), encoding='utf-8')
+                  print(json.dumps(result))
+          asyncio.run(main())
+          PY
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dramafren-access-probe-${{ github.sha }}
+          path: output/result.json
+          retention-days: 1
