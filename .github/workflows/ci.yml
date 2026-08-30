@@ -28,6 +28,9 @@ jobs:
           authorize_drive.py
           run_server.py
           media_core.py
+          dramafren_adapter.py
+          dramafren_job.py
+          dramafren_drive.py
           process_job.py
           local_worker.py
 
@@ -46,6 +49,27 @@ jobs:
           print("Mandatory clean-only and all-public profile invariants OK")
           PY
 
+      - name: Smoke-test DramaFren adapter
+        run: |
+          python - <<'PY'
+          from dramafren_adapter import _episode_numbers_from_html, episode_url, parse_drama_ref
+          from dramafren_drive import SOURCE_POLICY
+
+          ref = parse_drama_ref(
+              "https://dramabox.dramafren.org/index.php?ep=12&id=42000005228&lang=en&view=watch"
+          )
+          assert ref.drama_id == "42000005228"
+          assert ref.lang == "en"
+          assert "ep=64" in episode_url(ref, 64)
+          episodes = _episode_numbers_from_html(
+              "<p>Total: 64 Eps</p><a href='?ep=1&id=42000005228'>Ep 1</a>",
+              ref.drama_id,
+          )
+          assert episodes == list(range(1, 65))
+          assert SOURCE_POLICY == "direct-public-non-drm-only"
+          print("DramaFren adapter smoke test OK")
+          PY
+
       - name: Import and smoke-test MCP server
         run: |
           python - <<'PY'
@@ -54,6 +78,8 @@ jobs:
           assert health["ok"]
           assert health["source_policy"] == "clean-only"
           assert health["profile_scope"] == "all_public"
+          assert health["dramafren_source_policy"] == "direct-public-non-drm-only"
+          assert health["dramafren_scope"] == "all_public_episodes"
           print("Tokisclone MCP import and health OK")
           PY
 
