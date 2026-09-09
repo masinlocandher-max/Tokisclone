@@ -24,6 +24,8 @@ jobs:
         run: >-
           python -m py_compile
           server.py
+          rest_api.py
+          tiktok_portability.py
           drive_storage.py
           authorize_drive.py
           run_server.py
@@ -50,6 +52,36 @@ jobs:
           profile_source = inspect.getsource(media_core._extract_profile)
           assert '"playlistend"' not in profile_source
           print("Mandatory clean-only and all-public profile invariants OK")
+          PY
+
+      - name: Smoke-test authorized TikTok export parsing
+        run: |
+          python - <<'PY'
+          import io
+          import json
+          import zipfile
+
+          import tiktok_portability
+
+          payload = {
+              "Posts": [
+                  {
+                      "Date": "2026-09-09",
+                      "Title": "Owned post",
+                      "Posted Video Download Link": "https://example.com/video.mp4",
+                  }
+              ]
+          }
+          archive = io.BytesIO()
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.writestr("Posts.json", json.dumps(payload))
+
+          records = tiktok_portability.extract_posted_video_links(archive.getvalue())
+          assert len(records) == 1
+          assert records[0]["download_url"] == "https://example.com/video.mp4"
+          assert records[0]["context"]["Title"] == "Owned post"
+          assert tiktok_portability.choose_download_record(records, index=0) == records[0]
+          print("Authorized TikTok portability parser OK")
           PY
 
       - name: Smoke-test DramaFren unified queue
@@ -123,6 +155,18 @@ jobs:
           assert health["source_policy"] == "clean-only"
           assert health["profile_scope"] == "all_public"
           print("Tokisclone MCP import and health OK")
+          PY
+
+      - name: Import REST API
+        run: |
+          python - <<'PY'
+          import rest_api
+          paths = {route.path for route in rest_api.routes}
+          assert "/v1/tiktok/authorized/request" in paths
+          assert "/v1/tiktok/authorized/status" in paths
+          assert "/v1/tiktok/authorized/links" in paths
+          assert "/v1/tiktok/authorized/download" in paths
+          print("Tokisclone authorized TikTok REST routes import OK")
           PY
 
       - name: Import local worker and launcher
