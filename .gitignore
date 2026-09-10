@@ -14,3 +14,6 @@ cookies.txt
 *.db
 *.db-wal
 *.db-shm
+
+# tokgrab local working directory (Chrome profile, cookies, inventory, media)
+.tokisclone/

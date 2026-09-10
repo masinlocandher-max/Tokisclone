@@ -4,6 +4,21 @@ Tokisclone is a clean-room personal media archiving tool for public TikTok video
 
 It does not use TokScript code and does not depend on TokScript.
 
+## Fastest path: `tokgrab`
+
+If you just want one profile URL archived into your own Google Drive, use
+`tokgrab.py` and skip the queue/worker/Actions machinery entirely:
+
+```bash
+python tokgrab.py doctor
+python tokgrab.py login
+python tokgrab.py run @username
+```
+
+Run it on your own computer and home internet. See **BULK_DOWNLOADER.md** for
+setup, troubleshooting, and why the datacenter-based paths in this repo return
+empty profiles.
+
 ## Product rules
 
 ### TikTok

@@ -31,6 +31,7 @@ jobs:
           run_server.py
           start_worker.py
           media_core.py
+          tokgrab.py
           process_job.py
           local_worker.py
           dramafren_drive_worker.py
@@ -53,6 +54,9 @@ jobs:
           assert '"playlistend"' not in profile_source
           print("Mandatory clean-only and all-public profile invariants OK")
           PY
+
+      - name: Test tokgrab bulk downloader logic
+        run: python test_tokgrab.py
 
       - name: Smoke-test authorized TikTok export parsing
         run: |
