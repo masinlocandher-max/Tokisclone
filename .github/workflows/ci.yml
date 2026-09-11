@@ -32,6 +32,8 @@ jobs:
           start_worker.py
           media_core.py
           tokgrab.py
+          test_tokgrab_integration.py
+          test_tokgrab_browser.py
           process_job.py
           local_worker.py
           dramafren_drive_worker.py
@@ -57,6 +59,12 @@ jobs:
 
       - name: Test tokgrab bulk downloader logic
         run: python test_tokgrab.py
+
+      - name: Test tokgrab fetch/push integration
+        run: python test_tokgrab_integration.py
+
+      - name: Test tokgrab profile scanner
+        run: python test_tokgrab_browser.py
 
       - name: Smoke-test authorized TikTok export parsing
         run: |

@@ -75,16 +75,25 @@ same rule the README states, actually enforced.
 > that all depend on it. That is a separate decision and it is yours to make.
 > The finding above is what I would fix first if you want the old path repaired.
 
-### One more thing worth saying plainly
+### What is verified, and what is not
 
-I could not test any of this against live TikTok. The container I worked in
-blocks outbound traffic to tiktok.com and has no yt-dlp installed, so
-`test_tokgrab.py` covers the logic — format choice, watermark detection, state,
-resumability — and nothing else. The browser and network behaviour is reasoned
-from how the code and the platform work, not observed. **Your first real run is
-the test.** Start with a small profile.
+`test_tokgrab.py`, `test_tokgrab_integration.py` and `test_tokgrab_browser.py`
+run in CI and cover:
 
----
+- format scoring, watermark detection, height capping, and refusal
+- file naming, metadata writing, and the exact format id handed to yt-dlp
+- resumability: a rerun skips completed videos and does not retry failures
+  unless you pass `--retry-failed`
+- error isolation: one bad video does not end the run
+- Drive dedupe: a second `push` uploads nothing
+- the profile scanner driving a real browser through a lazy-loading page,
+  collecting every link, deduping and stopping at the end of the feed
+
+What is **not** verified is the live TikTok call itself - this environment
+blocks tiktok.com, so the scanner was proved against a local page that behaves
+like a profile grid, and the downloader against a faked yt-dlp. Everything
+around the network is tested. The network hop is not. **Start with a small
+profile.**
 
 ## Setup, once
 

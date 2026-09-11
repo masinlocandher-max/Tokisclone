@@ -696,11 +696,19 @@ def cmd_push(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    for step in (cmd_scan, cmd_fetch, cmd_push):
-        code = step(args)
-        if code == 2:
-            return code
-    return 0
+    # A scan that found nothing must stop the pipeline. Running fetch and push
+    # over an empty inventory just buries the real error under two more.
+    code = cmd_scan(args)
+    if code != 0:
+        return code
+
+    fetch_code = cmd_fetch(args)
+    if fetch_code == 2:
+        return fetch_code
+
+    # Push whatever did download, even if some videos failed.
+    push_code = cmd_push(args)
+    return fetch_code or push_code
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
