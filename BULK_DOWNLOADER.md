@@ -4,8 +4,7 @@ This is the short path. One command archives every public video on a TikTok
 profile into your own Google Drive, clean rendition, resumable.
 
 ```bash
-python tokgrab.py doctor          # check your setup
-python tokgrab.py login           # log into TikTok once, in a real browser
+python tokgrab.py setup           # installs everything, walks both logins
 python tokgrab.py run @username   # scan -> download -> upload to Drive
 ```
 
@@ -90,43 +89,31 @@ the test.** Start with a small profile.
 ## Setup, once
 
 ```bash
-pip install -r requirements-worker.txt
-playwright install chromium
+python tokgrab.py setup
 ```
 
-You also want `ffmpeg` on your PATH (`brew install ffmpeg`,
-`sudo apt install ffmpeg`, or the Windows build).
+That installs the python packages and the browser, then walks you through both
+logins. Two things it cannot do for you:
 
-**Google Drive**, once:
+1. **The Google OAuth client.** Google Cloud Console -> create an OAuth
+   **Desktop** client -> download the JSON as `client_secret.json` in this
+   folder. `setup` will tell you if it is missing.
+2. **Your Drive folder id.** Make a folder in your Drive, open it, copy the last
+   part of the URL (`drive.google.com/drive/folders/THIS_PART`), then
+   `cp .env.example .env` and set `GOOGLE_DRIVE_ROOT_FOLDER_ID` to it.
 
-1. Google Cloud Console → create an OAuth **Desktop** client → download the JSON
-   as `client_secret.json` into this folder.
-2. Make a folder in your Drive. Open it. The id is the last part of the URL:
-   `drive.google.com/drive/folders/THIS_PART`.
-3. `cp .env.example .env` and set `GOOGLE_DRIVE_ROOT_FOLDER_ID` to that id.
-4. `python authorize_drive.py`
+Use **your own** Google account, not a service account. Service accounts have no
+storage quota of their own and files they upload are owned by the robot, not by
+you - that is how you end up with an archive you cannot reach.
 
-This uses **your own** Google account, so files land in your Drive and count
-against your quota. Do not use a service account here — service accounts have no
-storage quota of their own, and files they upload are owned by the robot, not by
-you. That is a common way to end up with an archive you cannot actually reach.
-
-**TikTok**, once:
-
-```bash
-python tokgrab.py login
-```
-
-A Chrome window opens. Log in normally. Press Enter in the terminal. The session
-is saved to `~/.tokisclone/tokgrab/` and reused by every later command. Redo this
-if downloads start failing after a few weeks — sessions expire.
-
----
+Rerun `python tokgrab.py login` if downloads start failing after a few weeks.
+TikTok sessions expire.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `setup` | Installs dependencies and walks the Drive + TikTok logins |
 | `doctor` | Checks python, yt-dlp, playwright, ffmpeg, cookies, Drive credentials |
 | `login` | Opens real Chrome, saves your TikTok session |
 | `scan @user` | Scrolls the profile to the end, writes `inventory.json` |
@@ -174,32 +161,16 @@ a folder you do not own.
 
 ---
 
-## If these are your own videos
+## If the videos are your own
 
-Then do not scrape at all — you are picking the hardest path for content you
-already have rights to.
+TikTok's data export (Settings -> Account -> Download your data) hands you your
+posted videos officially, with no scraping. I could not verify from here whether
+that export is watermark-free - request one and check a single file before
+building on it. `TIKTOK_AUTHORIZED_DOWNLOAD.md` stubs the Data Portability API
+for the same purpose; note its documented EEA/UK scope limit.
 
-- **Keep the original file before you post it.** Nothing beats this.
-- **TikTok's data export** (Settings → Account → Download your data) hands you
-  your posted videos officially, with no scraping and no arms race. Whether that
-  export is watermark-free is something I could not verify from here — request
-  one and check a single file before you build a workflow on it.
-- `TIKTOK_AUTHORIZED_DOWNLOAD.md` in this repo already stubs the Data
-  Portability API path for exactly this. Note its documented limit: TikTok
-  currently scopes that API to EEA and UK users, and your app needs approval.
+## What tokgrab does with watermarks
 
-Scraping is the right tool for public content you do not control. For your own
-posts it is the fallback, not the plan.
-
----
-
-## A note on watermarks
-
-Removing the watermark removes the attribution. For your own content that is
-just a clean master. For someone else's, a repost with the credit stripped is
-the single fastest way to get an account struck and a reputation damaged — and
-the strike is the small part. Worth being deliberate about, not accidental.
-
-tokgrab selects a rendition TikTok itself serves without a mark. It does not
-blur, crop, paint over, or erase a burned-in watermark, and it will not be
-extended to.
+It selects a rendition TikTok itself serves without a mark. It does not blur,
+crop, paint over, or erase a burned-in watermark, because those produce a
+visibly degraded file rather than a clean master.

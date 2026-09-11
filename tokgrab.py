@@ -703,6 +703,66 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Install everything tokgrab needs, then walk the two logins."""
+    import shutil
+    import subprocess
+
+    def run(label: str, command: list[str]) -> bool:
+        log(f"\n-> {label}")
+        try:
+            subprocess.check_call(command)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            log(f"   failed: {exc}")
+            return False
+        return True
+
+    root = Path(__file__).resolve().parent
+    reqs = root / "requirements-worker.txt"
+
+    ok = run(
+        "Installing python packages",
+        [sys.executable, "-m", "pip", "install", "-q", "-U", "-r", str(reqs)],
+    )
+    if not ok:
+        log("Could not install dependencies. Fix pip, then rerun `setup`.")
+        return 1
+
+    run("Installing the browser playwright drives", [sys.executable, "-m", "playwright", "install", "chromium"])
+
+    if not shutil.which("ffmpeg"):
+        log("\n[warn] ffmpeg is not on your PATH. Install it before a big run:")
+        log("       macOS: brew install ffmpeg")
+        log("       Ubuntu/Debian: sudo apt install ffmpeg")
+        log("       Windows: winget install Gyan.FFmpeg")
+
+    log("\n-> Google Drive")
+    token = Path(os.getenv("GOOGLE_DRIVE_TOKEN_FILE", "token.json"))
+    folder = args.drive_folder or os.getenv("GOOGLE_DRIVE_ROOT_FOLDER_ID")
+    if not (root / "client_secret.json").exists():
+        log("   Missing client_secret.json.")
+        log("   Google Cloud Console -> create an OAuth *Desktop* client -> download")
+        log(f"   the JSON and save it as {root / 'client_secret.json'}")
+    elif token.exists():
+        log(f"   Already authorized ({token}).")
+    else:
+        run("   Authorizing Google Drive", [sys.executable, str(root / "authorize_drive.py")])
+
+    if not folder:
+        log("\n   Set GOOGLE_DRIVE_ROOT_FOLDER_ID in .env. Open your Drive folder;")
+        log("   the id is the last part of the URL after /folders/.")
+
+    log("\n-> TikTok")
+    cookies = Path(args.cookies).expanduser()
+    if cookies.exists() and "sessionid" in cookies.read_text(encoding="utf-8", errors="ignore"):
+        log("   Session already saved.")
+    else:
+        cmd_login(args)
+
+    log("\nRunning doctor to confirm:\n")
+    return cmd_doctor(args)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     problems = 0
 
@@ -775,6 +835,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check that everything is installed and configured")
     doctor.add_argument("--drive-folder", default=None)
     doctor.set_defaults(func=cmd_doctor)
+
+    setup = sub.add_parser("setup", help="install dependencies and walk both logins")
+    setup.add_argument("--drive-folder", default=None)
+    setup.set_defaults(func=cmd_setup)
 
     login = sub.add_parser("login", help="log into TikTok once in a real browser")
     login.set_defaults(func=cmd_login)

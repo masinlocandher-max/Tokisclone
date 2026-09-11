@@ -10,8 +10,7 @@ If you just want one profile URL archived into your own Google Drive, use
 `tokgrab.py` and skip the queue/worker/Actions machinery entirely:
 
 ```bash
-python tokgrab.py doctor
-python tokgrab.py login
+python tokgrab.py setup
 python tokgrab.py run @username
 ```
 
